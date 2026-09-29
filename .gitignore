@@ -4,3 +4,27 @@ data/
 .pytest_cache/
 .DS_Store
 Thumbs.db
+# Legacy local-memory export; never commit personal memory contents.
+codex_memories_data.js
+# Personal runtime state and exports belong outside the public source tree.
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.jsonl
+.env
+.env.*
+private/
+local/
+exports/
+backups/
+screenshots/
+*.log
+.venv/
+.codex/
+.claude/
+memory_summary.md
+MEMORY.md
+!examples/demo-memories/memory_summary.md
+!examples/demo-memories/MEMORY.md

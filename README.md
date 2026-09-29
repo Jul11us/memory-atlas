@@ -1,147 +1,162 @@
-<div align="center">
-  <img src="assets/memory-atlas.svg" alt="Memory Atlas logo" width="88" height="88">
-  <h1>Memory Atlas</h1>
-  <p><strong>本地记忆与项目规则图谱 · Local Memory & Project Rules Graph</strong></p>
-  <p>
-    <a href="#中文">简体中文</a> ·
-    <a href="#english">English</a> ·
-    <a href="#privacy--隐私">隐私说明 Privacy</a>
-  </p>
-  <p>
-    <img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white" alt="Python 3.10+">
-    <img src="https://img.shields.io/badge/dependencies-none-2EA44F" alt="No third-party dependencies">
-    <img src="https://img.shields.io/badge/runs-locally-7B61FF" alt="Runs locally">
-  </p>
-</div>
+<p align="center"><img src="assets/memory-atlas.svg" width="80" alt="Memory Atlas"></p>
+<h1 align="center">Memory Atlas</h1>
+<p align="center">把分散的本地记忆，变成 AI 可以按需调用的背景。<br>Local memory your AI can retrieve when it needs context.</p>
+<p align="center">Python 3.10+ · No Python dependencies · Local HTTP API · Adjustable decay</p>
 
----
+<p align="center"><a href="#中文">中文</a> · <a href="#english">English</a> · <a href="docs/integration.md">API & Agent integration</a></p>
+
+![Memory Atlas with fictional demo memories](assets/demo-preview.jpg)
+
+*截图来自隔离的虚构演示数据 / Screenshot uses isolated, fictional demo data.*
 
 ## 中文
 
-Memory Atlas 是一个在本机运行的浏览与检索工具，将本机可访问的 Codex 记忆摘要，以及 Claude Code、Cursor、Gemini CLI 等工具使用的记忆或项目规则文件整理成关联图谱。Codex 来源默认启用；其他来源由用户选择导入。你可以用关键词检索、手动反馈与修正；反馈会影响检索排序，手动运行“学习”步骤后还可观察关联权重如何调整。这里的“学习”是图谱反馈原型，不代表训练底层 AI 模型。
+Memory Atlas 是一个本机运行的记忆检索服务和图谱界面。它把你选择的 AI 工具记忆、项目规则和 Markdown 笔记组织起来，让你或自己的 Agent 在回答问题之前找回相关背景、决定与偏好。
 
-能否找到文件取决于它们是否在这台电脑上可访问，以及扫描目录如何配置；与底层模型在本地还是云端运行无关。纯云端工作区中的文件需要先同步或导出到本机。程序不会主动扫描会话数据库或 `JSONL` 聊天日志，但手动导入的文本文件内容可能进入图谱。它不调用云端 API，也不修改来源文件或其他工具的记忆。
+比如：先找回某个项目为什么选择 SQLite，再把这段背景提供给当前任务；重要偏好可以固定，临时结论在长期未使用后逐渐消散。你需要在自己的 Agent 或应用中接入调用，才能把检索结果放进模型的上下文。
 
-### 快速开始
+### 先体验，再接入自己的记忆
 
-需要 Python 3.10 或更新版本，不需要安装第三方依赖。
+安装 Python 3.10 或更新版本，然后：
 
-**Windows：** 下载仓库后，双击 `一键启动.bat`。等待浏览器打开 `http://127.0.0.1:8765`；使用期间保留启动窗口，按 `Ctrl+C` 停止服务。
-
-**macOS / Linux：** 在项目目录运行：
-
-```bash
-python3 memory_atlas.py
+```sh
+git clone https://github.com/Jul11us/memory-atlas.git
+cd memory-atlas
+python memory_atlas.py --demo
 ```
 
-然后在浏览器打开 <http://127.0.0.1:8765>。也可以使用 `python start_website.py` 启动并自动打开浏览器。
+打开 <http://127.0.0.1:8765>。`--demo` 使用仓库内的**虚构记忆**和独立的 `data/demo.sqlite3`，不会发现你本机的 AI 工具目录。
 
-### 功能
+准备使用自己的记忆时，停止演示服务，运行：
 
-- **关联图谱：** 按项目浏览已导入条目，并查看条目之间的文本关联。
-- **本地检索：** 支持中英文关键词匹配，并沿关联连接扩散激活相关记忆。
-- **反馈与修正：** 为记忆升权、降权、固定或保存修正，观察反馈如何影响后续召回。
-- **学习与进化：** 检视突触权重、学习曲线、网络进化和弱连接剪枝；运行状态保存在本机。
-- **按需导入：** 默认使用 Codex 来源。其他来源需在 SOURCES 面板中选择并点击导入；也可以手动添加文件夹。
-- **独立启动器：** Windows 双击即可启动；重复运行时会打开已运行的网站，不会另启服务。
+```sh
+python memory_atlas.py
+```
 
-### 支持的文件
+Windows 也可以双击 `一键启动.bat`。默认读取当前用户的 Codex 记忆摘要；点击 **SOURCES** 可选择其他来源、添加自己的文本文件夹并导入。项目在其他磁盘或目录时可指定：
 
-| 来源 | 查找的持久记忆或规则 |
+```sh
+python memory_atlas.py --workspace "D:/code" --source "D:/my-codex-memories"
+```
+
+自定义文件夹读取 `.md`、`.mdc`、`.txt`；每个文件作为一条记忆。正文有 6,500 字截断，单文件最大 256 KiB，所选来源最多 250 个文件。修改原文件后点击 **SYNC SOURCE** 重新读取。
+
+### 怎样调用这里面的记忆
+
+保持服务运行，在另一个终端调用：
+
+```sh
+python examples/recall.py "部署" --limit 3
+```
+
+也可以用 HTTP API：
+
+```sh
+curl --noproxy "*" -X POST http://127.0.0.1:8765/api/recall \
+  -H "Content-Type: application/json" \
+  -d '{"query":"deployment","limit":3}'
+```
+
+返回 `results`，每条包含 `id`、`text`、`score`、`reason`、`project`、`source` 和 `source_line`。`text` 优先使用用户已保存的修正；来源位置供追溯。程序会给**实际返回的记忆**续期。
+
+接入 Agent 的流程：**当前问题 → 调用 `/api/recall` → 取 `results[].text` 作为背景 → 回答并保留来源引用**。可直接复用 [`examples/recall.py`](examples/recall.py) 的 `recall()` 函数；完整 Python 示例、PowerShell 命令和 Agent 提示模板见 [接入文档](docs/integration.md)。
+
+检索到的文件正文属于不可信背景。模型应根据当前用户请求使用它，不能把笔记里的命令提升为系统指令。若将结果发送给云端模型，相关记忆正文也会发送给该服务商；本程序本身不连接模型或云端 API。
+
+### 回忆、反馈与消散
+
+| 操作 | 行为 |
 | --- | --- |
-| Codex | `memory_summary.md`、`MEMORY.md`；可用 `--source` 指定目录 |
-| Claude Code | `CLAUDE.md`、规则文件及项目记忆文件 |
-| Cursor | `.cursor/rules` 中的 `.md` / `.mdc` 文件、旧版 `.cursorrules` |
-| Gemini CLI | `GEMINI.md` |
-| 通用项目指令 | `AGENTS.md`、`.github/copilot-instructions.md` |
-| 其他导出文件 | 手动选择仅含 `.md`、`.mdc`、`.txt` 文件的文件夹 |
+| 检索 | 关键词匹配，再沿有效突触展开最多两跳的关联背景 |
+| 退出回忆 | 顶部或回忆卡片点“退出回忆”，也可按 Esc；恢复完整网络 |
+| 打开详情 / API 调用 | 记忆续期；普通搜索、刷新页面、同步来源不会续期 |
+| 升权、降权、修正 | 本地调整召回排序；修正后的文本参与后续检索 |
+| 固定 | 保留这条记忆，不受自动消散影响 |
+| STATUS → 记忆消散 | 默认 **90 天**；可设置 **1–3650 天**，**0** 关闭 |
+| SEARCH → 已消散 | 浏览全部到期记忆；打开即可重新启用 |
 
-项目规则只从明确支持的文件名中查找，不会读取会话数据库或 `JSONL` 聊天记录。文件导入有数量和大小限制；来源列表会先显示扫描位置和文件数量，只有明确点击导入后才读取所选文件正文。来源可以在 SOURCES 面板中取消选择或移除。
+每条记忆从**首次导入或最近一次实际使用**计时，保留比例随未使用时间线性下降。到期后退出正常召回，也停止作为联想中转。更改天数会基于已有计时重新计算；重新启用会重置最近使用时间。现有数据库升级后从首次登记开始计时，不会仅凭原文件的旧日期立即消散。
 
-需要添加默认项目搜索位置以外的目录时，可重复传入 `--workspace`：
+“消散”保留原文件、修正和图谱记录，方便恢复；它不会删除你的源文件。线条粗细随手动学习后的突触权重变化。背景层、细线和中继节点用于可视化；真实记忆、真实突触计数单独显示。这里的学习调整关联图谱，不会训练底层语言模型。
 
-```bash
-python memory_atlas.py --workspace "D:\\code" --workspace "/mnt/work/app"
-```
+### 支持的来源
 
-### 隐私与数据
+| 来源 | 读取的文件 |
+| --- | --- |
+| Codex（默认启用） | `memory_summary.md`、`MEMORY.md` |
+| Claude Code | 自动记忆、`CLAUDE.md`、`CLAUDE.local.md`、`.claude/rules` |
+| Cursor 规则 | `.cursorrules`、`.cursor/rules` 中的 Markdown 规则 |
+| Gemini CLI | 全局及项目 `GEMINI.md` |
+| 通用 Agent 指令 | `AGENTS.md`、`.github/copilot-instructions.md` |
+| 自定义 | 你明确选择的 Markdown / 文本文件夹 |
 
-- 服务仅绑定 `127.0.0.1`，仅供这台电脑访问；页面不加载外部脚本、字体或 API。
-- 来源文件只读，不会被复制、修改或删除。来源选择、自定义文件夹路径、反馈与图谱权重保存在 `data/feedback.sqlite3`；搜索词不保存在数据库中。
-- `data/` 已加入 Git 忽略规则；提交仓库时不会包含本机数据库。
-- 只导入你有权读取并希望加入本地图谱的文件。`AGENTS.md`、规则和 `GEMINI.md` 属于工具指令文件，不等同于 AI 产品内部的记忆。
-- 检索使用本地关键词匹配，不提供向量语义检索。页面里的神经元、突触和学习是便于检查关联与反馈的原型模型，不是语言模型的真实训练或神经元结构。
+文件必须在运行本服务的电脑上可访问。云端工作区需要先导出或同步到本机。工具规则文件会作为可检索文本，读取范围不包括会话数据库、应用内 Memories 或 JSONL 聊天日志。
 
-### 开发与验证
+### 隐私与公开仓库
 
-```powershell
-python -m unittest discover -s tests -v
-```
+服务绑定 `127.0.0.1`，没有遥测、第三方脚本或云端请求。源文件只读；来源路径、反馈、修正、调用时间、设置和学习权重留在本机的 `data/` 数据库。搜索问题不写入数据库，也不记录 HTTP 请求日志。
 
-没有包含用户数据库或依赖安装步骤。项目目前是**本地运行的软件**，不是已托管的在线服务。
+公开仓库包含程序、文档、测试、虚构示例和演示截图。真实记忆、数据库、导出文件、密钥、本机路径和个人截图不属于发布内容。`.gitignore` 排除运行数据，`scripts/check_public.py` 限定经过审核的公开文件并检查常见敏感模式。发布新截图或笔记时仍需人工检查正文与画面。
 
----
+文本文件里也可能包含隐私或密钥，请只导入自己愿意检索的内容。此服务面向单用户本机使用；同一台电脑上能访问端口的进程也可调用 API，请不要将端口公开到互联网。
 
 ## English
 
-Memory Atlas is a local browser app that organizes accessible Codex memory summaries and the memory or project rule files used by tools such as Claude Code, Cursor, and Gemini CLI into an association graph. Codex is enabled by default; you choose whether to import other sources. You can search by keyword, give manual feedback, and correct entries. Feedback affects search ranking; after you run a learning step, you can also inspect changes to connection weights. This “learning” is a graph feedback prototype, not training of the underlying AI model.
+Memory Atlas is a local retrieval service with a visual memory graph. It organizes selected AI-tool memories, project rules, and Markdown notes so you or your agent can recover useful decisions, preferences, and project context before answering.
 
-Whether files can be found depends on their accessibility from this computer and the configured scan directories; it does not depend on whether the underlying model runs locally or in the cloud. Files kept only in a remote workspace must first be synced or exported here. The app does not proactively scan conversation databases or `JSONL` chat logs, though the contents of text files you import manually may enter the graph. It does not call cloud APIs or modify source files or other tools' memories.
+Configure your agent or application to call the local API and include the returned text in its model context. The application performs keyword retrieval with up to two hops of graph association; it does not train a language model or generate answers.
 
 ### Quick start
 
-Python 3.10 or newer is required. There are no third-party dependencies.
+Requires Python 3.10+. No third-party Python packages are needed.
 
-**Windows:** Download the repository and double-click `一键启动.bat`. Wait for your browser to open `http://127.0.0.1:8765`. Keep the launcher window open while using the app; press `Ctrl+C` in that window to stop it.
-
-**macOS / Linux:** From the project directory, run:
-
-```bash
-python3 memory_atlas.py
+```sh
+git clone https://github.com/Jul11us/memory-atlas.git
+cd memory-atlas
+python memory_atlas.py --demo
 ```
 
-Then visit <http://127.0.0.1:8765>. You can also run `python start_website.py` to start the app and open your browser automatically.
+Visit <http://127.0.0.1:8765>. Demo mode uses fictional bundled notes and a separate `data/demo.sqlite3`; it does not discover your AI-tool folders. Stop the demo and run `python memory_atlas.py` to use your own sources. On Windows, `一键启动.bat` starts the personal local app.
 
-### Features
+Codex summaries are selected by default. Use **SOURCES** to choose other supported sources or explicitly import a text folder. Use `--source` for a Codex memory directory and repeated `--workspace` flags for other project locations. Files must be accessible on the machine running the server. Cloud workspaces must first export or sync their files locally.
 
-- **Association graph:** Browse imported entries by project and inspect text-based connections.
-- **Local search:** Match Chinese and English keywords, then follow associations to related memories.
-- **Feedback and corrections:** Boost, lower, pin, or correct a memory and see how feedback affects later retrieval.
-- **Learning prototype:** Inspect connection weights, learning history, graph evolution, and weak-edge pruning. State is stored locally.
-- **Opt-in import:** Codex is selected by default. Choose other sources in the SOURCES panel and explicitly import them; folders can also be added manually.
-- **One-click Windows launcher:** Double-click to start. Launching again opens the existing site without starting a second server.
+### Give an agent memory context
 
-### Supported files
+With the server running:
 
-| Source | Persistent memory or rule files |
-| --- | --- |
-| Codex | `memory_summary.md`, `MEMORY.md`; use `--source` to select a directory |
-| Claude Code | `CLAUDE.md`, rule files, and project memory files |
-| Cursor | `.md` / `.mdc` files under `.cursor/rules`, plus legacy `.cursorrules` |
-| Gemini CLI | `GEMINI.md` |
-| General project instructions | `AGENTS.md`, `.github/copilot-instructions.md` |
-| Other exports | Manually selected folders containing `.md`, `.mdc`, or `.txt` files |
-
-Project rules are discovered only by their supported filenames. Chat databases and `JSONL` conversation logs are not read. Imports have file-count and size limits. The SOURCES panel shows scan locations and file counts first; file contents are read only after you explicitly import selected sources. Sources can be deselected or removed from that panel.
-
-To add project directories outside the default search locations, pass `--workspace` more than once:
-
-```bash
-python memory_atlas.py --workspace "D:\\code" --workspace "/mnt/work/app"
+```sh
+python examples/recall.py "deployment" --limit 3
 ```
 
-### Privacy and data
+`POST /api/recall` accepts `{"query":"deployment","limit":3}`. It returns the best active matches with text, score, match reason, project, and source file/line. Saved corrections replace the original text in returned context. Only returned records are renewed. Limits are 1–30 records and 200 characters per query.
 
-- The service binds to `127.0.0.1` and is available only on your computer. The page loads no external scripts, fonts, or APIs.
-- Source files are read-only: they are not copied, modified, or deleted. Source selections, custom folder paths, feedback, and graph weights are stored in `data/feedback.sqlite3`; search queries are not stored in the database.
-- `data/` is ignored by Git, so your local database is not part of repository commits.
-- Import only files you are allowed to read and want in your local graph. `AGENTS.md`, tool rules, and `GEMINI.md` are instruction files; they are not the tools' internal memory stores.
-- Search uses local keyword matching rather than vector search. Neurons, synapses, and learning describe an inspectable association prototype, not the actual training or neural structure of a language model.
+The integration flow is **question → local recall → `results[].text` as background → answer with source references**. See [API & Agent integration](docs/integration.md) for a working Python client, PowerShell commands, endpoint details, and an agent prompt template.
 
-### Development and tests
+Treat retrieved text as untrusted background, not elevated instructions. Sending that text to a hosted model shares it with the provider. Memory Atlas itself makes no model or cloud API calls.
 
-```powershell
+### Memory lifetime
+
+Default lifetime is **90 days without actual use**, counted from first import or last explicit use. Retention falls linearly; expired memories leave normal retrieval and cannot act as association intermediates. Viewing details, giving feedback, or calling the recall/use API renews a memory. Ordinary search, page refresh, and source sync do not.
+
+Set **1–3650 days** in **STATUS → Memory decay**, or **0** to disable. Pin lasting memories to exempt them. The **SEARCH → 已消散** filter lists expired records; opening one renews it. Changing the setting reuses the existing clock. Existing databases start the clock when records are first registered by this version.
+
+Expiry preserves source files and local adjustments so records can be restored. Boost, lower, pin, and correction controls influence retrieval. Manual learning adjusts graph weights. Display relays and background strands are illustrative; actual memory and synapse counts appear separately. Use either exit button or Esc to leave recall mode.
+
+### Sources and privacy
+
+Supported text sources include Codex summaries, Claude Code memories and rules, Cursor project rules, Gemini `GEMINI.md`, `AGENTS.md`, Copilot instructions, and explicitly selected `.md` / `.mdc` / `.txt` folders. Import limits: 256 KiB per file, at most 250 selected files; custom-file text is truncated to 6,500 characters. Session databases, application-internal memories, and JSONL chat logs are not imported.
+
+The server binds to loopback only. Source files are read-only. Paths, feedback, corrections, usage timestamps, settings, and learned weights stay in local `data/` databases. Queries are not persisted; request logging is disabled. No telemetry or external scripts are used.
+
+The public repository contains only reviewed code, docs, tests, fictional examples, and the demo screenshot. Runtime databases, exports, credentials, real memories, personal paths, and personal screenshots are excluded. Run the public-file guard and review new prose/screenshots before publishing. Imported text may itself contain secrets; choose sources carefully. Any local process that can access the port can use the API; keep it off the public internet.
+
+## Development
+
+```sh
 python -m unittest discover -s tests -v
+node --test tests/test_recall.cjs
+node --check static/app.js
+python scripts/check_public.py
 ```
 
-This repository does not include user databases or an install step. Memory Atlas currently runs locally; it is not a hosted web service.
+Node.js is only needed for the JavaScript checks. Runtime uses Python's standard library and vanilla browser JavaScript. Browser smoke checks should use `--demo` or temporary databases so they do not alter personal feedback.

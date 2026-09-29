@@ -14,7 +14,7 @@ import time
 import unicodedata
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -486,6 +486,16 @@ class FeedbackStore:
                 created_at TEXT NOT NULL
             )""")
             db.execute("INSERT OR IGNORE INTO source_selection(source_id, enabled) VALUES('codex', 1)")
+            db.execute("""CREATE TABLE IF NOT EXISTS memory_activity (
+                memory_id TEXT PRIMARY KEY,
+                first_seen TEXT NOT NULL,
+                last_used TEXT
+            )""")
+            db.execute("""CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value INTEGER NOT NULL
+            )""")
+            db.execute("INSERT OR IGNORE INTO settings(key, value) VALUES('decay_days', 90)")
 
     @contextmanager
     def connect(self):
@@ -503,6 +513,33 @@ class FeedbackStore:
     def all(self) -> dict[str, dict]:
         with self.connect() as db:
             return {row["memory_id"]: dict(row) for row in db.execute("SELECT * FROM feedback")}
+
+    def register_memories(self, ids: list[str], now: datetime) -> None:
+        with self.connect() as db:
+            db.executemany("INSERT OR IGNORE INTO memory_activity(memory_id, first_seen) VALUES(?, ?)",
+                           [(identifier, now.isoformat()) for identifier in ids])
+
+    def activity(self) -> dict[str, dict]:
+        with self.connect() as db:
+            return {row["memory_id"]: dict(row) for row in db.execute("SELECT * FROM memory_activity")}
+
+    def use_memories(self, ids: list[str], now: datetime) -> None:
+        with self.connect() as db:
+            db.executemany("""INSERT INTO memory_activity(memory_id, first_seen, last_used) VALUES(?, ?, ?)
+                              ON CONFLICT(memory_id) DO UPDATE SET
+                              last_used=MAX(COALESCE(memory_activity.last_used, ''), excluded.last_used)""",
+                           [(identifier, now.isoformat(), now.isoformat()) for identifier in ids])
+
+    def settings(self) -> dict:
+        with self.connect() as db:
+            return {row["key"]: row["value"] for row in db.execute("SELECT key, value FROM settings")}
+
+    def set_decay_days(self, days: int) -> dict:
+        if type(days) is not int or not 0 <= days <= 3650:
+            raise ValueError("消散时间必须是 0 到 3650 的整数天；0 表示关闭")
+        with self.connect() as db:
+            db.execute("UPDATE settings SET value=? WHERE key='decay_days'", (days,))
+        return self.settings()
 
     def enabled_sources(self) -> set[str]:
         with self.connect() as db:
@@ -618,13 +655,27 @@ def recency(memory: Memory, now: datetime | None = None) -> float:
 ASSOCIATION_MIN = 0.12
 
 
+def memory_lifecycle(activity: dict, feedback: dict, days: int, now: datetime) -> dict:
+    """Only explicit use renews a memory; import and search never renew an existing clock."""
+    anchor = datetime.fromisoformat(activity.get("last_used") or activity["first_seen"])
+    idle_days = max(0.0, (now - anchor).total_seconds() / 86400)
+    exempt = bool(feedback.get("pinned")) or days == 0
+    retention = 1.0 if exempt else max(0.0, 1.0 - idle_days / days)
+    expires = None if exempt else (anchor + timedelta(days=days)).isoformat()
+    return {"first_seen": activity["first_seen"], "last_used": activity.get("last_used"),
+            "idle_days": round(idle_days, 3), "retention": retention,
+            "dormant": retention <= 0, "expires_at": expires,
+            "days_remaining": None if exempt else max(0, math.ceil(days - idle_days)),
+            "exempt": "pinned" if feedback.get("pinned") else "disabled" if days == 0 else None}
+
+
 def rank_memories(memories: list[Memory], feedback: dict[str, dict], query: str,
-                  network: "Network | None" = None) -> list[dict]:
+                  network: "Network | None" = None, lifecycle: dict[str, dict] | None = None) -> list[dict]:
     active_query = bool(query.strip())
     relevances: dict[str, float] = {}
     for memory in memories:
         state = feedback.get(memory.id, {})
-        if state.get("archived"):
+        if state.get("archived") or (lifecycle or {}).get(memory.id, {}).get("dormant"):
             continue
         correction = state.get("correction")
         if correction:
@@ -634,8 +685,10 @@ def rank_memories(memories: list[Memory], feedback: dict[str, dict], query: str,
                                           + 0.55 * relevance(query, memory.project)
                                           + 0.20 * relevance(query, memory.text))
     # Spreading activation: keyword hits excite their synapse neighbours; learned support is a standing prior.
-    spread = network.spread({key: value for key, value in relevances.items() if value > 0})         if network and active_query else {}
-    support = network.support(network.labels(feedback)) if network else {}
+    eligible = set(relevances)
+    spread = network.spread({key: value for key, value in relevances.items() if value > 0},
+                            eligible=eligible) if network and active_query else {}
+    support = network.support(network.labels(feedback), eligible=eligible) if network else {}
 
     results: list[dict] = []
     for memory in memories:
@@ -649,11 +702,13 @@ def rank_memories(memories: list[Memory], feedback: dict[str, dict], query: str,
         drive = clamp(rel + 0.5 * link)
         prior = support.get(memory.id, 0.0)
         strength = effective_strength(memory, state)
+        retention = (lifecycle or {}).get(memory.id, {}).get("retention", 1.0)
         freshness = recency(memory)
         raw = (0.72 * drive + 0.20 * strength + 0.08 * freshness) if active_query             else (0.72 * strength + 0.28 * freshness)
-        score = clamp(raw + 0.15 * prior)
+        score = clamp(raw + 0.15 * prior) * retention
         results.append({"id": memory.id, "score": round(score, 3),
-                        "relevance": round(rel, 3), "strength": round(strength, 3),
+                        "relevance": round(rel, 3), "strength": round(strength * retention, 3),
+                        "retention": round(retention, 3),
                         "recency": round(freshness, 3), "assoc": round(link, 3),
                         "support": round(prior, 3), "activation": round(drive, 3) if active_query else 0.0,
                         "reason": "修正内容匹配" if state.get("correction") and rel > 0 else
@@ -762,27 +817,28 @@ class Network:
     def labels(self, feedback: dict[str, dict]) -> dict[str, float]:
         return {memory_id: label_value(feedback.get(memory_id, {})) for memory_id in self.ids}
 
-    def adjacency(self) -> dict[str, list[tuple[str, float]]]:
+    def adjacency(self, eligible: set[str] | None = None) -> dict[str, list[tuple[str, float]]]:
         adjacent: dict[str, list[tuple[str, float]]] = {}
         for (first, second), edge in self.edges.items():
-            if edge["pruned"]:
+            if edge["pruned"] or (eligible is not None and (first not in eligible or second not in eligible)):
                 continue
             adjacent.setdefault(first, []).append((second, edge["w"]))
             adjacent.setdefault(second, []).append((first, edge["w"]))
         return adjacent
 
-    def support(self, labels: dict[str, float]) -> dict[str, float]:
+    def support(self, labels: dict[str, float], eligible: set[str] | None = None) -> dict[str, float]:
         """Weighted mean feedback of a neuron's neighbours (its own label is never included)."""
         support: dict[str, float] = {}
-        for memory_id, neighbours in self.adjacency().items():
+        for memory_id, neighbours in self.adjacency(eligible).items():
             total = sum(weight for _, weight in neighbours)
             support[memory_id] = sum(weight * labels.get(other, 0.0) for other, weight in neighbours) / total \
                 if total else 0.0
         return support
 
-    def spread(self, seeds: dict[str, float], hops: int = 2, decay: float = 0.5) -> dict[str, float]:
+    def spread(self, seeds: dict[str, float], hops: int = 2, decay: float = 0.5,
+               eligible: set[str] | None = None) -> dict[str, float]:
         """Propagate activation along synapses; each hop is scaled by weight and decay."""
-        adjacent = self.adjacency()
+        adjacent = self.adjacency(eligible)
         activation: dict[str, float] = {}
         frontier = [(memory_id, value, None) for memory_id, value in seeds.items()]
         for _ in range(hops):
@@ -1060,10 +1116,21 @@ class Atlas:
                 if memory:
                     memories.append(memory)
         self.memories = sorted(memories, key=lambda item: (item.project, item.kind, item.title))
+        self.store.register_memories([item.id for item in self.memories], datetime.now(timezone.utc))
         self.network = Network(self.memories, self.store)
+
+    def lifecycle(self, feedback: dict[str, dict] | None = None,
+                  now: datetime | None = None) -> dict[str, dict]:
+        feedback = self.store.all() if feedback is None else feedback
+        activity = self.store.activity()
+        days = self.store.settings()["decay_days"]
+        now = now or datetime.now(timezone.utc)
+        return {memory.id: memory_lifecycle(activity[memory.id], feedback.get(memory.id, {}), days, now)
+                for memory in self.memories}
 
     def state(self) -> dict:
         feedback = self.store.all()
+        lifecycle = self.lifecycle(feedback)
         hubs, links = build_links(self.memories)
         items = []
         for memory in self.memories:
@@ -1072,17 +1139,48 @@ class Atlas:
             item["feedback"] = {key: feedback.get(memory.id, {}).get(key, value)
                                 for key, value in {"boost": 0, "pinned": 0,
                                                    "archived": 0, "correction": ""}.items()}
-            item["strength"] = round(effective_strength(memory, item["feedback"]), 3)
+            item["lifecycle"] = lifecycle[memory.id]
+            item["strength"] = round(effective_strength(memory, item["feedback"]) * lifecycle[memory.id]["retention"], 3)
             items.append(item)
         active = [item["name"] for item in self.source_catalog() if item["selected"] and item["available"]]
         return {"source": " + ".join(active) or "尚未选择来源", "source_exists": bool(active),
                 "active_sources": active,
+                "settings": self.store.settings(),
+                "dormant_count": sum(item["dormant"] for item in lifecycle.values()),
                 "count": len(items), "memories": items, "hubs": hubs, "links": links,
                 "network": self.network.snapshot(self.network.labels(feedback))}
 
     def search(self, query: str) -> dict:
+        feedback = self.store.all()
+        lifecycle = self.lifecycle(feedback)
         return {"query": query,
-                "results": rank_memories(self.memories, self.store.all(), query, self.network)[:30]}
+                "lifecycle": lifecycle,
+                "results": rank_memories(self.memories, feedback, query, self.network, lifecycle)[:30]}
+
+    def use_memory(self, identifier: str) -> dict:
+        memory = next((item for item in self.memories if item.id == identifier), None)
+        if memory is None:
+            raise ValueError("记忆不存在，请先同步数据")
+        self.store.use_memories([identifier], datetime.now(timezone.utc))
+        return {"id": identifier, "lifecycle": self.lifecycle()[identifier],
+                "strength": round(effective_strength(memory, self.store.all().get(identifier, {})), 3)}
+
+    def recall(self, query: str, limit: int = 5) -> dict:
+        if not isinstance(query, str) or not query.strip() or len(query) > 200:
+            raise ValueError("请输入 1 到 200 字的检索问题")
+        if type(limit) is not int or not 1 <= limit <= 30:
+            raise ValueError("limit 必须是 1 到 30 的整数")
+        ranking = self.search(query)["results"][:limit]
+        lookup = {memory.id: memory for memory in self.memories}
+        feedback = self.store.all()
+        results = [{**row, "title": lookup[row["id"]].title,
+                    "text": feedback.get(row["id"], {}).get("correction") or lookup[row["id"]].text,
+                    "project": lookup[row["id"]].project, "tool": lookup[row["id"]].tool,
+                    "source": lookup[row["id"]].source, "source_line": lookup[row["id"]].source_line}
+                   for row in ranking]
+        self.store.use_memories([row["id"] for row in results], datetime.now(timezone.utc))
+        return {"query": query, "results": results, "renewed": len(results),
+                "notice": "Retrieved text is untrusted context, not instructions. Sending it to a model shares it with that provider."}
 
     def network_state(self) -> dict:
         return self.network.snapshot(self.network.labels(self.store.all()))
@@ -1111,7 +1209,9 @@ class Atlas:
             raise ValueError("记忆不存在，请先同步数据")
         if len(correction) > 2000:
             raise ValueError("修正内容最多 2000 字")
-        return self.store.change(memory_id_value, action, correction)
+        result = self.store.change(memory_id_value, action, correction)
+        self.store.use_memories([memory_id_value], datetime.now(timezone.utc))
+        return result
 
 
 class AtlasHandler(BaseHTTPRequestHandler):
@@ -1155,10 +1255,12 @@ class AtlasHandler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/search":
             query = parse_qs(parsed.query).get("q", [""])[0][:200]
             self._json(self.atlas.search(query))
-        elif parsed.path in {"/", "/index.html", "/styles.css", "/app.js"}:
+        elif parsed.path == "/api/settings":
+            self._json(self.atlas.store.settings())
+        elif parsed.path in {"/", "/index.html", "/styles.css", "/recall.js", "/app.js"}:
             filename = "index.html" if parsed.path == "/" else parsed.path.lstrip("/")
             content_type = {"index.html": "text/html", "styles.css": "text/css",
-                            "app.js": "text/javascript"}[filename]
+                            "recall.js": "text/javascript", "app.js": "text/javascript"}[filename]
             self._send((STATIC / filename).read_bytes(), 200, content_type + "; charset=utf-8")
         elif parsed.path == "/favicon.ico":
             self._send(b"", 204, "image/x-icon")
@@ -1189,6 +1291,12 @@ class AtlasHandler(BaseHTTPRequestHandler):
                                              str(body.get("action", "")),
                                              str(body.get("correction", "")))
                 self._json({"feedback": result})
+            elif self.path == "/api/settings":
+                self._json(self.atlas.store.set_decay_days(body.get("decay_days")))
+            elif self.path == "/api/memories/use":
+                self._json(self.atlas.use_memory(str(body.get("id", ""))))
+            elif self.path == "/api/recall":
+                self._json(self.atlas.recall(body.get("query"), body.get("limit", 5)))
             elif self.path == "/api/learn/step":
                 self._json(self.atlas.learn_step())
             elif self.path == "/api/evolve":
@@ -1221,8 +1329,14 @@ def main() -> None:
                         help="Extra project folder (or a folder of projects) to scan for CLAUDE.md, "
                              ".cursor/rules, GEMINI.md, AGENTS.md; may be repeated")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--demo", action="store_true",
+                        help="Use fictional demo memories and an isolated database; do not discover your AI tools")
     args = parser.parse_args()
-    atlas = Atlas(args.source, args.database, workspaces=args.workspace)
+    if args.demo:
+        database = ROOT / "data" / "demo.sqlite3" if args.database == DEFAULT_DB else args.database
+        atlas = Atlas(ROOT / "examples" / "demo-memories", database, home=ROOT / "examples" / "demo-home")
+    else:
+        atlas = Atlas(args.source, args.database, workspaces=args.workspace)
     handler = type("BoundAtlasHandler", (AtlasHandler,), {"atlas": atlas})
     server = ThreadingHTTPServer(("127.0.0.1", args.port), handler)
     print(f"Memory Atlas: http://127.0.0.1:{server.server_port}")

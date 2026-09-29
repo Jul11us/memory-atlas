@@ -6,25 +6,30 @@ const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matc
 let atlas = null;
 let ranking = [];
 let selectedId = null;
+let recall = null;
+const recallTimers = [];
+const recallMatchMs = 650, recallHopMs = 620;
+let feedbackEvent = null;
+let feedbackBusy = false;
+let feedbackTimer;
+const weightTransitions = new Map();
 let activeFilter = "all";
 let currentQuery = "";
 let searchVersion = 0;
 let toastTimer;
 let graphNodes = new Map();
 let graphLayers = [];
-let graphEdges = [];
+let layoutIsMobile = null;
 let ambientPaths = [];
+let visualStrands = [];
+let hoveredId = null;
 let transform = {scale: 1, x: 0, y: 0};
 let pointer = null;
 const staticCanvas = document.createElement("canvas");
 let staticDirty = true;
-let ambientEdges = [];
 let projectPaths = new Map();
-let signals = [];
-let dust = [];
-let sparkles = [];
 // Relay tones (excitatory / neutral / inhibitory look) are decorative only.
-const relayTones = {amber: "#d6bc78", violet: "#9d96d6", rose: "#c7859d"};
+const relayTones = {amber: "#b9ad8a", violet: "#a39caf", rose: "#b4919e"};
 let synapseCurves = [];
 let learning = false;
 let converged = false;
@@ -63,6 +68,15 @@ function scoreFor(id) {
   return ranking.find((item) => item.id === id) || null;
 }
 
+function memoryForNode(node) {
+  if (!node || !atlas?.memories.length) return null;
+  if (node.kind === "memory") return atlas.memories.find((item) => item.id === node.id) || null;
+  if (node.kind !== "relay") return null;
+  const group = atlas.memories.filter((item) => item.project === node.project);
+  const choices = group.length ? group : atlas.memories;
+  return choices[(node.layer * 31 + node.slot * 7) % choices.length];
+}
+
 function displayTitle(memory) {
   const correction = memory.feedback.correction.trim();
   return correction ? `已修正：${correction.slice(0, 46)}` : memory.title;
@@ -72,14 +86,98 @@ function setText(id, value) {
   byId(id).textContent = value;
 }
 
+function updateRecallPhase(timestamp) {
+  const panel = byId("recall-panel");
+  panel.hidden = !currentQuery;
+  byId("quick-exit-recall").hidden = !currentQuery;
+  if (!currentQuery || !recall) return;
+  let phase = recall.phase;
+  if (["matching", "associating", "settled"].includes(phase)) {
+    const elapsed = timestamp - recall.startedAt;
+    const duration = recall.plan.edges.size ? recallMatchMs + 2 * recallHopMs + 350 : recallMatchMs;
+    phase = elapsed >= duration ? "settled" : elapsed >= recallMatchMs ? "associating" : "matching";
+  }
+  if (panel.dataset.phase === phase && recall.rendered) return;
+  recall.phase = phase;
+  recall.rendered = true;
+  panel.dataset.phase = phase;
+  const labels = {loading: "检索中", matching: "定位匹配", associating: "联想展开", settled: "回忆完成", empty: "没有找到相关记忆", error: "检索未完成"};
+  setText("recall-phase", labels[phase]);
+  const plan = recall.plan;
+  setText("recall-summary", phase === "loading" ? "正在检索本地记忆…" : phase === "empty" ? "换个关键词，或检查已导入的来源。" : phase === "error" ? recall.error
+    : `找到 ${plan.direct.size} 条直接匹配，${plan.associatedCount} 条关联背景。`);
+  setText("recall-caption", phase === "matching" ? "直接匹配先亮起，再沿真实关联展开。" : phase === "associating" ? "信号正沿真实连接传递。"
+    : phase === "settled" ? plan.shown ? `保留 ${plan.shown} 条重点关联路径；点击节点查看记忆。` : "已定位直接匹配；点击节点查看记忆。" : "记忆与来源都保留在本机。");
+  byId("recall-results").disabled = ["loading", "empty", "error"].includes(phase);
+  document.querySelectorAll("[data-recall-step]").forEach((step) => {
+    const order = ["matching", "associating", "settled"];
+    step.classList.toggle("is-current", step.dataset.recallStep === phase);
+    step.classList.toggle("is-done", order.indexOf(step.dataset.recallStep) < order.indexOf(phase));
+  });
+}
+
+function startRecall(animate) {
+  recallTimers.splice(0).forEach(clearTimeout);
+  if (!currentQuery) { recall = null; byId("recall-panel").hidden = true; return; }
+  const eligible = new Set(atlas.memories.filter((item) => !item.lifecycle?.dormant && !item.feedback.archived).map((item) => item.id));
+  const plan = MemoryRecall.plan(ranking, atlas.network.synapses.filter((edge) => eligible.has(edge.a) && eligible.has(edge.b)));
+  recall = {plan, phase: ranking.length ? "matching" : "empty", startedAt: performance.now() - (!animate || reducedMotion ? 3000 : 0)};
+  updateRecallPhase(performance.now());
+  if (animate && !reducedMotion && ranking.length) {
+    for (const delay of [recallMatchMs + 10, recallMatchMs + 2 * recallHopMs + 360]) {
+      recallTimers.push(setTimeout(() => drawGraph(performance.now()), delay));
+    }
+  }
+}
+
+function recallArrival(id) {
+  const hop = recall?.plan?.arrivals.get(id);
+  return hop == null ? Infinity : hop === 0 ? 0 : recallMatchMs + hop * recallHopMs;
+}
+
+function recallActivation(timestamp) {
+  const activation = new Map();
+  if (!currentQuery || !recall?.plan) return activation;
+  const elapsed = timestamp - recall.startedAt;
+  for (const [id] of recall.plan.arrivals) {
+    if (elapsed >= recallArrival(id)) activation.set(id, scoreFor(id)?.activation || .25);
+  }
+  return activation;
+}
+
+function renderFeedbackNote() {
+  const note = byId("feedback-note");
+  const visible = feedbackEvent?.id === selectedId;
+  note.hidden = !visible;
+  if (visible) { note.textContent = feedbackEvent.message; note.dataset.action = feedbackEvent.action; }
+}
+
 function renderStats() {
   if (!atlas) return;
   setText("memory-count", atlas.count);
   setText("project-count", atlas.hubs.length);
   setText("link-count", atlas.network.stats.connections);
-  setText("source-status", atlas.source_exists ? `已读取 ${atlas.count} 条本地记忆 · ${atlas.source}` : "尚无可读取的已选来源");
+  setText("source-status", atlas.source_exists ? `已读取 ${atlas.count} 条本地记忆${atlas.dormant_count ? ` · ${atlas.dormant_count} 条已消散` : ""} · ${atlas.source}` : "尚无可读取的已选来源");
+  if (document.activeElement !== byId("decay-days")) byId("decay-days").value = atlas.settings.decay_days;
+  setText("decay-summary", `${atlas.settings.decay_days ? `当前 ${atlas.settings.decay_days} 天` : "消散已关闭"} · ${atlas.dormant_count} 条已消散`);
   setText("active-source-label", atlas.source || "未选择");
   byId("graph-empty").hidden = atlas.count > 0;
+}
+
+function updateProbe() {
+  const probe = byId("memory-probe");
+  const node = graphNodes.get(hoveredId);
+  const memory = memoryForNode(node);
+  probe.hidden = !memory;
+  canvas.parentElement.parentElement.classList.toggle("is-probing", Boolean(memory));
+  if (!memory) return;
+  setText("probe-heading", node.kind === "relay" ? "ASSOCIATED MEMORY / DISPLAY RELAY" : "LIVE MEMORY PROBE");
+  setText("probe-id", `ID: hl${node.layer}.${String(node.slot + 1).padStart(2, "0")} | Ref: ${memory.id.slice(0, 10)}`);
+  setText("probe-kind", `Kind: ${memory.kind}`);
+  setText("probe-group", `Group: ${memory.project}`);
+  const activation = currentQuery ? scoreFor(memory.id)?.activation || 0 : memory.id === selectedId ? 1 : 0;
+  setText("probe-activation", `Activation: ${activation.toFixed(3)} · Weight: ${memory.strength.toFixed(2)}`);
+  setText("probe-text", memory.feedback.correction.trim() || memory.text);
 }
 
 function updateSourceSelectionCount() {
@@ -143,13 +241,15 @@ function renderResults() {
   const list = byId("result-list");
   list.replaceChildren();
   const memoryById = new Map(atlas.memories.map((item) => [item.id, item]));
-  const results = ranking.filter((result) => {
+  const candidates = activeFilter === "dormant" ? atlas.memories.filter((item) => item.lifecycle?.dormant).map((item) => ({id: item.id, score: 0, reason: "已消散 · 打开即可重新启用"})) : ranking;
+  const results = candidates.filter((result) => {
     const memory = memoryById.get(result.id);
     if (!memory) return false;
+    if (activeFilter === "dormant") return true;
     if (activeFilter === "preference") return ["preference", "profile"].includes(memory.kind);
     return activeFilter === "all" || memory.kind === activeFilter;
   });
-  setText("results-label", currentQuery ? "MATCHED MEMORIES" : "TOP MEMORIES");
+  setText("results-label", activeFilter === "dormant" ? "DORMANT MEMORIES / 全部已消散" : currentQuery ? "MATCHED MEMORIES" : "TOP MEMORIES");
   setText("results-count", `${results.length} 条`);
 
   if (!results.length) {
@@ -173,7 +273,7 @@ function renderResults() {
     type.textContent = `${memory.tool || "Codex"} / ${kindLabels[memory.kind] || memory.kind}`;
     const score = document.createElement("span");
     score.className = "result-score";
-    score.textContent = `${Math.round(result.score * 100)} / 100`;
+    score.textContent = memory.lifecycle?.dormant ? "已消散" : `${Math.round(result.score * 100)} / 100`;
     top.append(type, score);
     const title = document.createElement("strong");
     title.className = "result-title";
@@ -188,6 +288,7 @@ function renderResults() {
 
 function renderDetail() {
   const memory = currentMemory();
+  renderFeedbackNote();
   byId("detail-placeholder").hidden = Boolean(memory);
   byId("detail-content").hidden = !memory;
   if (!memory) return;
@@ -202,7 +303,7 @@ function renderDetail() {
   setText("original-text", memory.text);
   byId("correction-banner").hidden = !correction;
   byId("original-details").hidden = !correction;
-  byId("correction-input").value = correction;
+  if (document.activeElement !== byId("correction-input")) byId("correction-input").value = correction;
   setText("base-value", memory.importance.toFixed(2));
   setText("strength-value", memory.strength.toFixed(2));
   byId("base-bar").style.width = `${memory.importance * 100}%`;
@@ -214,6 +315,8 @@ function renderDetail() {
   byId("pin-button").classList.toggle("is-active", Boolean(memory.feedback.pinned));
   byId("pin-button").textContent = memory.feedback.pinned ? "取消固定" : "固定";
   setText("source-path", `${memory.source}:${memory.source_line}`);
+  const life = memory.lifecycle;
+  if (life) setText("memory-lifetime", life.exempt === "pinned" ? "已固定，持续保留。" : life.exempt === "disabled" ? "已关闭自动消散。" : `${life.last_used ? `最近使用 ${new Date(life.last_used).toLocaleString()}` : "从首次导入开始计时，尚未使用"} · ${life.dormant ? "已消散，不参与正常召回" : `约 ${life.days_remaining} 天后消散，保留 ${Math.round(life.retention * 100)}%`}。`);
   renderSynapseList(memory);
 }
 
@@ -221,20 +324,49 @@ function selectMemory(id) {
   selectedId = id;
   renderResults();
   renderDetail();
+  updateProbe();
   openInspector();
+  ensureSelectedVisible();
   drawGraph(performance.now());
+  renewMemory(id).catch((error) => notify(`记忆续期失败：${error.message}`));
+}
+
+async function renewMemory(id) {
+  const result = await post("/api/memories/use", {id});
+  const memory = atlas.memories.find((item) => item.id === id);
+  if (!memory) return;
+  memory.lifecycle = result.lifecycle;
+  memory.strength = result.strength;
+  atlas.dormant_count = atlas.memories.filter((item) => item.lifecycle?.dormant).length;
+  renderStats();
+  layoutGraph();
+  await search(currentQuery, true);
 }
 
 function openInspector() {
+  byId("workspace").classList.add("is-inspecting");
   byId("detail-panel").classList.add("is-open");
   byId("detail-panel").setAttribute("aria-hidden", "false");
   byId("inspect-toggle").setAttribute("aria-expanded", "true");
 }
 
 function closeInspector() {
+  byId("workspace").classList.remove("is-inspecting");
   byId("detail-panel").classList.remove("is-open");
   byId("detail-panel").setAttribute("aria-hidden", "true");
   byId("inspect-toggle").setAttribute("aria-expanded", "false");
+}
+
+function ensureSelectedVisible() {
+  const node = graphNodes.get(selectedId), width = canvas.getBoundingClientRect().width;
+  if (!node || width < 700 || !byId("workspace").classList.contains("is-inspecting")) return;
+  const left = dock.search || dock.hud ? 248 : 40;
+  const right = Math.max(left + 30, byId("detail-panel").offsetLeft - 30);
+  const x = node.x * transform.scale + transform.x;
+  if (x < left || x > right) {
+    transform.x += Math.max(left, Math.min(right, x)) - x;
+    staticDirty = true;
+  }
 }
 
 async function loadState() {
@@ -247,36 +379,103 @@ async function loadState() {
   await search(currentQuery, true);
   byId("search-input").disabled = false;
   byId("search-form").querySelector("button").disabled = false;
+  byId("quick-search-input").disabled = false;
 }
 
 async function search(query, preserveSelection = false) {
   const version = ++searchVersion;
   const nextQuery = query.trim();
-  const changed = nextQuery !== currentQuery;
   currentQuery = nextQuery;
-  const data = await request(`/api/search?q=${encodeURIComponent(currentQuery)}`);
-  if (version !== searchVersion) return;
-  ranking = data.results;
-  if (!preserveSelection && changed) {
-    selectedId = currentQuery ? ranking[0]?.id || null : null;
-    if (selectedId) openInspector(); else closeInspector();
+  byId("search-input").value = nextQuery;
+  byId("quick-search-input").value = nextQuery;
+  if (!preserveSelection) {
+    recallTimers.splice(0).forEach(clearTimeout);
+    ranking = [];
+    selectedId = null;
+    hoveredId = null;
+    transform = {scale: 1, x: 0, y: 0};
+    staticDirty = true;
+    closeInspector();
+    recall = {phase: "loading"};
+    updateProbe();
+    updateRecallPhase(performance.now());
+    renderResults();
+    renderDetail();
+    drawGraph(performance.now());
   }
+  let data;
+  try { data = await request(`/api/search?q=${encodeURIComponent(nextQuery)}`); }
+  catch (error) {
+    if (version !== searchVersion) return false;
+    ranking = [];
+    recall = {phase: "error", error: error.message};
+    updateRecallPhase(performance.now());
+    renderResults();
+    drawGraph(performance.now());
+    throw error;
+  }
+  if (version !== searchVersion) return false;
+  for (const memory of atlas.memories) {
+    const life = data.lifecycle?.[memory.id];
+    if (!life) continue;
+    memory.lifecycle = life;
+    memory.strength = Math.min(1, Math.max(0, memory.importance + .12 * memory.feedback.boost + .08 * memory.feedback.pinned)) * life.retention;
+    const node = graphNodes.get(memory.id);
+    if (node) node.retention = life.retention;
+  }
+  atlas.dormant_count = atlas.memories.filter((item) => item.lifecycle?.dormant).length;
+  renderStats();
+  ranking = data.results;
+  startRecall(!preserveSelection);
   renderResults();
   renderDetail();
+  updateProbe();
   drawGraph(performance.now());
+  return true;
 }
 
 async function post(path, data) {
   return request(path, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(data)});
 }
 
+function exitRecall() {
+  clearTimeout(debounce);
+  clearTimeout(feedbackTimer);
+  feedbackEvent = null;
+  search("").catch((error) => notify(error.message));
+  document.querySelector('[data-dock="search"]').focus({preventScroll: true});
+  notify("已退出回忆，恢复完整网络");
+}
+
 async function changeFeedback(action, correction = "") {
-  if (!selectedId) return;
+  if (!selectedId || feedbackBusy) return;
+  const id = selectedId;
+  const before = atlas.memories.find((item) => item.id === id);
+  feedbackBusy = true;
+  const buttons = ["boost-button", "down-button", "pin-button", "reset-button", "save-correction"].map(byId);
+  buttons.forEach((button) => { button.disabled = true; });
+  let saved = false;
   try {
-    await post("/api/feedback", {id: selectedId, action, correction});
+    await post("/api/feedback", {id, action, correction});
+    saved = true;
     await loadState();
-    notify(action === "correct" ? "修正已保存，本地检索已更新" : "权重已更新");
-  } catch (error) { notify(error.message); }
+    const after = atlas.memories.find((item) => item.id === id);
+    if (!after) { notify("反馈已保存，该记忆已不在当前来源中"); return; }
+    const delta = after.strength - before.strength;
+    const actionText = {boost: "已强化", down: "已降权", correct: "修正已保存", pin: after.feedback.pinned ? "已固定" : "已取消固定", reset: "已重置调整"}[action];
+    const changed = JSON.stringify(before.feedback) !== JSON.stringify(after.feedback);
+    const message = action === "correct" ? `修正已保存，这条记忆以后将按新内容检索。召回权重 ${before.strength.toFixed(2)} → ${after.strength.toFixed(2)}。`
+      : !changed ? action === "reset" ? "当前没有需要重置的调整。" : `已达到调整上限，召回权重保持 ${after.strength.toFixed(2)}。`
+      : `${actionText} · 召回权重 ${before.strength.toFixed(2)} → ${after.strength.toFixed(2)}。`;
+    feedbackEvent = {id, action, startedAt: performance.now(), delta, changed, message,
+      label: action === "correct" ? "已修正 · 按新内容检索" : `${actionText}${Math.abs(delta) > .0005 ? ` ${delta > 0 ? "+" : ""}${delta.toFixed(2)}` : ""}`};
+    renderFeedbackNote();
+    drawGraph(performance.now());
+    clearTimeout(feedbackTimer);
+    feedbackTimer = setTimeout(() => drawGraph(performance.now()), 2600);
+    notify(message);
+  } catch (error) { notify(saved ? `反馈已保存，页面刷新失败：${error.message}` : error.message); }
+  finally { feedbackBusy = false; buttons.forEach((button) => { button.disabled = false; }); }
 }
 
 function layoutGraph() {
@@ -291,20 +490,30 @@ function layoutGraph() {
   staticCanvas.height = canvas.height;
   graphNodes = new Map();
   const mobile = width < 700;
+  if (layoutIsMobile !== null && layoutIsMobile !== mobile) {
+    transform = {scale: 1, x: 0, y: 0};
+    hoveredId = null;
+  }
+  layoutIsMobile = mobile;
   const layerCount = mobile ? 7 : 9;
   graphLayers = Array.from({length: layerCount}, () => []);
-  graphEdges = [];
   ambientPaths = [];
-  const left = mobile ? 34 : Math.min(300, Math.max(242, width * .165));
+  visualStrands = [];
+  const dockOpen = dock.search || dock.hud;
+  const left = mobile ? 34 : dockOpen ? 262 : Math.min(190, Math.max(140, width * .115));
   const right = mobile ? width - 35 : width - Math.min(94, Math.max(65, width * .055));
   const top = mobile ? 35 : 34;
   const bottom = height - (mobile ? 24 : 25);
-  const slots = Math.max(mobile ? 21 : 38, Math.ceil(atlas.memories.length / (layerCount - 1)) + 2, atlas.hubs.length + 2);
+  const baseSlots = mobile ? [15, 21, 21, 21, 21, 21, 21] : [21, 30, 30, 30, 30, 30, 30, 30, 31];
   const projects = atlas.hubs.map((hub) => hub.name);
   const layerMemories = Array.from({length: layerCount - 1}, () => []);
   atlas.memories.forEach((memory, index) => layerMemories[index % (layerCount - 1)].push(memory));
-  const yFor = (slot) => top + (bottom - top) * slot / (slots - 1);
-  const xFor = (layer) => left + (right - left) * layer / (layerCount - 1);
+  const slotsByLayer = baseSlots.map((count, layer) => Math.max(count, layer === 0 ? atlas.hubs.length + 2 : layerMemories[layer - 1].length + 2));
+  // A slight shear and alternating depth keep the columns legible while giving them volume.
+  const depthFor = (layer) => mobile || layer === 0 ? 0 : (layer % 2 ? 8 : 3);
+  const yFor = (slot, layer) => top + depthFor(layer) + (bottom - top - depthFor(layer) * 2) * slot / (slotsByLayer[layer] - 1);
+  const xFor = (layer, slot = (slotsByLayer[layer] - 1) / 2) => left + (right - left) * layer / (layerCount - 1)
+    + (mobile ? 0 : (slot / (slotsByLayer[layer] - 1) - .5) * 18);
   const labelRow = document.querySelector(".layer-labels");
   labelRow.replaceChildren();
   labelRow.style.gridTemplateColumns = `repeat(${layerCount}, 1fr)`;
@@ -312,12 +521,13 @@ function layoutGraph() {
   labelRow.style.paddingRight = `${Math.max(0, width - right - (right - left) / (layerCount - 1) / 2)}px`;
   for (let layer = 0; layer < layerCount; layer++) {
     const label = document.createElement("span");
-    label.textContent = layer === 0 ? "INPUT" : layer === layerCount - 1 ? "OUTPUT" : `HL ${layer}`;
+    label.textContent = layer === 0 ? "INPUT" : `HL ${layer}`;
     labelRow.append(label);
   }
 
   // Relay nodes are display-only routing points. Real memory records retain their own IDs.
   for (let layer = 0; layer < layerCount; layer++) {
+    const slots = slotsByLayer[layer];
     const memorySlots = new Map();
     if (layer === 0) {
       atlas.hubs.forEach((hub, index) => memorySlots.set(Math.round((index + .5) * (slots - 1) / atlas.hubs.length), hub));
@@ -331,10 +541,11 @@ function layoutGraph() {
       const project = kind === "hub" ? real.name : kind === "memory" ? real.project : projects[(slot + layer * 3) % Math.max(1, projects.length)];
       const id = real?.id || `relay-${layer}-${slot}`;
       const roll = hash01(layer * 131 + slot * 17 + 5);
-      const node = {id, kind, project, layer, slot, x: xFor(layer), y: yFor(slot),
+      const node = {id, kind, project, layer, slot, x: xFor(layer, slot), y: yFor(slot, layer),
         tone: roll < .5 ? "violet" : roll < .8 ? "amber" : "rose",
         signal: kind === "memory" ? labelValue(real.feedback) : 0,
-        radius: kind === "hub" ? 4.3 : kind === "memory" ? 2.7 + real.strength * 1.6 : mobile ? 2.1 : 2.5,
+        retention: kind === "memory" ? real.lifecycle?.retention ?? 1 : 1,
+        radius: kind === "hub" ? 2.6 : kind === "memory" ? 1.6 + real.strength * .65 : mobile ? 1.45 : 1.3,
         label: kind === "hub" ? real.name : kind === "memory" ? displayTitle(real) : ""};
       graphNodes.set(id, node);
       graphLayers[layer].push(node);
@@ -348,48 +559,46 @@ function layoutGraph() {
       const matches = graphLayers[layer + 1].filter((to) => to.project === from.project)
         .sort((a, b) => Math.abs(a.slot - from.slot) - Math.abs(b.slot - from.slot));
       for (const to of matches.slice(0, mobile ? 3 : 6)) {
-        graphEdges.push({from, to, project: from.project});
         if (!projectPaths.has(from.project)) projectPaths.set(from.project, new Path2D());
         addCurve(projectPaths.get(from.project), from, to, .47);
       }
     }
   }
 
-  // Dense background threads create depth only; they do not represent imported memories.
-  // Most strands fan out to nearby slots (the hourglass look); a minority reach anywhere in the next layer.
+  // Exact desktop visual topology: 262 nodes and 3820 unique display strands at baseline.
+  // Strands are illustrative routes; only synapseCurves below are learned memory links.
   ambientPaths = Array.from({length: 3}, () => new Path2D());
-  ambientEdges = [];
-  const strands = mobile ? 5 : 12;
+  const targetCount = mobile ? 1260 : 3820;
+  const pairsByLayer = [];
   for (let layer = 0; layer < layerCount - 1; layer++) {
-    const target = graphLayers[layer + 1];
-    for (const from of graphLayers[layer]) {
-      for (let strand = 0; strand < strands; strand++) {
-        const seed = layer * 10000 + from.slot * 97 + strand * 19;
-        const near = hash01(seed + 1) < .78;
-        const fraction = near ? from.slot / (slots - 1) + (hash01(seed + 2) - .5) * .36 : hash01(seed + 2);
-        const to = target[Math.max(0, Math.min(target.length - 1, Math.round(fraction * (target.length - 1))))];
-        const bucket = Math.floor(hash01(seed + 3) * ambientPaths.length);
-        addCurve(ambientPaths[bucket], from, to, .45);
-        ambientEdges.push({from, to, bucket});
-      }
+    const candidates = [];
+    for (const from of graphLayers[layer]) for (const to of graphLayers[layer + 1]) {
+      const distance = Math.abs(from.slot / (graphLayers[layer].length - 1) - to.slot / (graphLayers[layer + 1].length - 1));
+      const seed = layer * 100000 + from.slot * 151 + to.slot * 17;
+      candidates.push({from, to, rank: distance * .72 + hash01(seed) * .58});
     }
+    candidates.sort((a, b) => a.rank - b.rank);
+    pairsByLayer.push(candidates);
   }
-
-  // Floating dust and travelling signals are decoration too.
-  const span = right - left;
-  dust = Array.from({length: mobile ? 120 : 320}, (_, i) => ({
-    x: left - 40 + hash01(i * 3.3 + 1) * (span + 80), y: top + hash01(i * 5.1 + 2) * (bottom - top),
-    r: .45 + hash01(i * 7.7 + 3) * .75, a: .12 + hash01(i * 2.9 + 4) * .28}));
-  sparkles = Array.from({length: mobile ? 24 : 80}, (_, i) => ({
-    x: left - 30 + hash01(i * 4.7 + 11) * (span + 60), y: top + hash01(i * 6.3 + 12) * (bottom - top),
-    r: .7 + hash01(i * 1.9 + 13) * .7, phase: hash01(i * 8.1 + 14) * Math.PI * 2,
-    speed: .0006 + hash01(i * 2.3 + 15) * .0009, drift: 3 + hash01(i * 9.7 + 16) * 7}));
-  signals = Array.from({length: mobile ? 60 : 170}, (_, i) => ({
-    edge: ambientEdges[Math.floor(hash01(i * 7.7 + 9) * ambientEdges.length)],
-    offset: hash01(i * 3.1 + 5), period: 4200 + hash01(i * 1.7 + 6) * 4800}));
+  const perLayer = Math.floor(targetCount / pairsByLayer.length);
+  pairsByLayer.forEach((pairs, layer) => {
+    const quota = perLayer + (layer < targetCount % pairsByLayer.length ? 1 : 0);
+    for (const {from, to} of pairs.slice(0, quota)) {
+      const seed = layer * 100000 + from.slot * 151 + to.slot * 17;
+      const bucket = Math.floor(hash01(seed + 3) * ambientPaths.length);
+      addCurve(ambientPaths[bucket], from, to, .45);
+      const dx = to.x - from.x;
+      visualStrands.push({from, to, c1: {x: from.x + dx * .45, y: from.y}, c2: {x: to.x - dx * .45, y: to.y}, phase: hash01(seed + 7), bucket});
+    }
+  });
+  setText("visual-neurons", graphNodes.size);
+  setText("visual-connections", visualStrands.length);
+  if (hoveredId && !graphNodes.has(hoveredId)) hoveredId = null;
+  updateProbe();
 
   rebuildSynapses();
   staticDirty = true;
+  ensureSelectedVisible();
   drawGraph(performance.now());
 }
 
@@ -399,18 +608,22 @@ function addCurve(path, from, to, bend) {
   path.bezierCurveTo(from.x + dx * bend, from.y, to.x - dx * bend, to.y, to.x, to.y);
 }
 
-function bezierPoint(edge, t, bend) {
-  const {from, to} = edge;
-  const dx = to.x - from.x, u = 1 - t;
-  const c1 = from.x + dx * bend, c2 = to.x - dx * bend;
-  return {x: u * u * u * from.x + 3 * u * u * t * c1 + 3 * u * t * t * c2 + t * t * t * to.x,
-    y: u * u * u * from.y + 3 * u * u * t * from.y + 3 * u * t * t * to.y + t * t * t * to.y};
+const ambientColors = ["rgba(169, 181, 170, .058)", "rgba(166, 158, 192, .052)", "rgba(185, 166, 145, .048)"];
+
+function drawVisualFlow(timestamp) {
+  if (reducedMotion || !visualStrands.length || !atlas?.count) return;
+  const mobile = canvas.getBoundingClientRect().width < 700;
+  const count = Math.min(visualStrands.length, mobile ? 240 : currentQuery ? 450 : 2000);
+  for (let index = 0; index < count; index++) {
+    const strand = visualStrands[(index * 37) % visualStrands.length];
+    const t = (timestamp / 3900 + strand.phase) % 1;
+    const point = cubicPoint(strand.from, strand.c1, strand.c2, strand.to, t);
+    ctx.fillStyle = currentQuery ? "rgba(194, 190, 208, .045)" : "rgba(194, 190, 208, .28)";
+    ctx.beginPath(); ctx.arc(point.x, point.y, .55, 0, Math.PI * 2); ctx.fill();
+  }
 }
 
-const ambientColors = ["rgba(169, 181, 170, .085)", "rgba(166, 158, 192, .075)", "rgba(185, 166, 145, .07)"];
-const signalColors = ["#b4e2cb", "#bebaf0", "#eed6a0"];
-
-// The unselected backdrop (guides, dense threads, dust) is cached and only redrawn when the view changes.
+// The unselected backdrop (guides and dense threads) is cached and only redrawn when the view changes.
 function renderStatic(dpr, height) {
   const sctx = staticCanvas.getContext("2d");
   sctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -418,26 +631,21 @@ function renderStatic(dpr, height) {
   sctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   sctx.translate(transform.x, transform.y);
   sctx.scale(transform.scale, transform.scale);
-  sctx.strokeStyle = "rgba(137, 133, 176, .12)"; sctx.lineWidth = .7;
+  sctx.strokeStyle = "rgba(157, 151, 170, .13)"; sctx.lineWidth = .5;
   for (const layer of graphLayers) {
-    const x = layer[0]?.x;
-    if (x == null) continue;
-    sctx.beginPath(); sctx.moveTo(x, 42); sctx.lineTo(x, height - 25); sctx.stroke();
+    const first = layer[0], last = layer[layer.length - 1];
+    if (!first || !last) continue;
+    sctx.beginPath(); sctx.moveTo(first.x, first.y); sctx.lineTo(last.x, last.y); sctx.stroke();
   }
   ambientColors.forEach((color, index) => {
-    sctx.strokeStyle = color; sctx.lineWidth = .6; sctx.stroke(ambientPaths[index]);
+    sctx.strokeStyle = color; sctx.lineWidth = .45; sctx.stroke(ambientPaths[index]);
   });
-  sctx.fillStyle = "#d8dcec";
-  for (const mote of dust) {
-    sctx.globalAlpha = mote.a;
-    sctx.beginPath(); sctx.arc(mote.x, mote.y, mote.r, 0, Math.PI * 2); sctx.fill();
-  }
-  sctx.globalAlpha = 1;
   staticDirty = false;
 }
 
 function drawGraph(timestamp) {
   if (!atlas) return;
+  updateRecallPhase(timestamp);
   const rect = canvas.getBoundingClientRect();
   const width = rect.width;
   const height = rect.height;
@@ -445,18 +653,21 @@ function drawGraph(timestamp) {
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   if (staticDirty) renderStatic(dpr, height);
+  ctx.globalAlpha = currentQuery ? .16 : 1;
   if (staticCanvas.width) ctx.drawImage(staticCanvas, 0, 0);
+  ctx.globalAlpha = 1;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.translate(transform.x, transform.y);
   ctx.scale(transform.scale, transform.scale);
-  const activeIds = new Set(currentQuery ? ranking.slice(0, 12).map((item) => item.id) : []);
-  const activeProjects = new Set([...activeIds].map((id) => graphNodes.get(id)?.project).filter(Boolean));
+  drawVisualFlow(timestamp);
+  const activation = recallActivation(timestamp);
+  const activeIds = new Set(activation.keys());
+  if (selectedId) activation.set(selectedId, 1);
   const selectedProject = graphNodes.get(selectedId)?.project;
 
   for (const [project, path] of projectPaths) {
     const selectedPath = selectedProject && project === selectedProject;
-    const activePath = activeProjects.has(project);
-    ctx.strokeStyle = selectedPath ? "rgba(232, 195, 132, .26)" : activePath ? "rgba(162, 217, 191, .2)" : "rgba(150, 155, 177, .13)";
+    ctx.strokeStyle = currentQuery ? "rgba(150, 155, 177, .008)" : selectedPath ? "rgba(232, 195, 132, .12)" : "rgba(150, 155, 177, .055)";
     ctx.lineWidth = selectedPath ? .9 : .65;
     ctx.stroke(path);
   }
@@ -468,83 +679,72 @@ function drawGraph(timestamp) {
     if (link.kind === "project" && to.layer > 1) continue;
     ctx.beginPath(); ctx.moveTo(from.x, from.y); ctx.lineTo(to.x, to.y);
     const lit = from.id === selectedId || to.id === selectedId;
-    ctx.strokeStyle = lit ? "rgba(239, 202, 136, .33)" : "rgba(169, 166, 214, .07)";
+    ctx.strokeStyle = lit ? "rgba(239, 202, 136, .33)" : currentQuery ? "rgba(169, 166, 214, .012)" : "rgba(169, 166, 214, .07)";
     ctx.lineWidth = lit ? 1 : .55; ctx.stroke();
   }
 
-  // Activation: the top recall results plus the selected memory; it spreads along real synapses.
-  const activation = new Map();
-  if (currentQuery) for (const item of ranking.slice(0, 24)) activation.set(item.id, item.activation || item.score);
-  if (selectedId) activation.set(selectedId, 1);
+  // Only the representative routes are animated; unrelated projects stay in the background.
   drawSynapses(timestamp, activation);
-
-  if (!reducedMotion) {
-    for (const signal of signals) {
-      const t = (timestamp / signal.period + signal.offset) % 1;
-      const point = bezierPoint(signal.edge, t, .45);
-      ctx.globalAlpha = .15 + .6 * Math.sin(Math.PI * t);
-      ctx.fillStyle = signalColors[signal.edge.bucket];
-      ctx.beginPath(); ctx.arc(point.x, point.y, 1.05, 0, Math.PI * 2); ctx.fill();
-    }
-    ctx.fillStyle = "#e9ecf7";
-    for (const spark of sparkles) {
-      ctx.globalAlpha = .12 + .3 * (.5 + .5 * Math.sin(timestamp * spark.speed * 3 + spark.phase));
-      ctx.beginPath();
-      ctx.arc(spark.x + Math.sin(timestamp * spark.speed + spark.phase) * spark.drift,
-        spark.y + Math.cos(timestamp * spark.speed * .8 + spark.phase) * spark.drift, spark.r, 0, Math.PI * 2);
-      ctx.fill();
-    }
-    ctx.globalAlpha = 1;
-
-    const moving = selectedProject || (currentQuery && activeProjects.values().next().value);
-    graphEdges.filter((edge) => moving ? edge.project === moving && edge.from.slot % 3 === 0 : edge.from.slot % 11 === 0).slice(0, moving ? 32 : 18).forEach((edge, index) => {
-      const phase = (timestamp / 3100 + index * .13) % 1;
-      const x = edge.from.x + (edge.to.x - edge.from.x) * phase;
-      const y = edge.from.y + (edge.to.y - edge.from.y) * phase;
-      ctx.beginPath(); ctx.arc(x, y, moving ? 1.2 : .75, 0, Math.PI * 2);
-      ctx.fillStyle = selectedProject ? "rgba(249, 213, 153, .75)" : moving ? "rgba(167, 230, 201, .7)" : "rgba(220, 211, 180, .36)"; ctx.fill();
-    });
-  }
 
   for (const node of graphNodes.values()) {
     const selected = node.id === selectedId;
     const active = activeIds.has(node.id);
+    const hovered = node.id === hoveredId;
     const inProject = selectedProject && node.project === selectedProject;
-    if (selected || active) {
-      ctx.beginPath(); ctx.arc(node.x, node.y, node.radius + (selected ? 11 : 7), 0, Math.PI * 2);
-      ctx.fillStyle = selected ? "rgba(245, 199, 129, .14)" : "rgba(166, 226, 193, .1)"; ctx.fill();
+    ctx.globalAlpha = currentQuery && !selected && !active && !hovered ? .2 : 1;
+    if (!selected && !active && !hovered) ctx.globalAlpha *= .12 + .88 * node.retention;
+    if (selected || active || hovered) {
+      const energy = Math.max(0, node.signal || 0);
+      const halo = node.radius + (selected ? 8 + (node.signal || 0) * 4 : active ? 6 : 4);
+      ctx.beginPath(); ctx.arc(node.x, node.y, halo, 0, Math.PI * 2);
+      ctx.fillStyle = selected && node.signal < -.05 ? "rgba(218, 124, 155, .11)" : selected || active ? `rgba(245, 199, 129, ${.15 + energy * .12})` : "rgba(183, 171, 244, .18)"; ctx.fill();
+      if (selected || active) {
+        ctx.beginPath(); ctx.arc(node.x, node.y, halo * .75, 0, Math.PI * 2);
+        ctx.strokeStyle = selected && node.signal < -.05 ? "rgba(229, 138, 160, .55)" : `rgba(250, 210, 139, ${.52 + energy * .24})`;
+        ctx.lineWidth = selected ? 1.4 + energy * 1.3 : 1.1; ctx.stroke();
+      }
     }
-    ctx.fillStyle = selected ? "#f2cf91" : active ? "#b5e5ca" : node.kind === "hub" ? "#9fcfbc" : node.kind === "memory" ? memoryTone(node.signal) : inProject ? "#c6b899" : relayTones[node.tone];
+    ctx.fillStyle = selected && node.signal < -.05 ? suppressColor : selected || active ? "#ffd98c" : hovered ? "#d2bdf9" : node.kind === "hub" ? "#9fcfbc" : node.kind === "memory" ? memoryTone(node.signal) : inProject ? "#c6b899" : relayTones[node.tone];
     if (node.kind === "relay" && !selected && !active) {
       // Flat halo instead of shadowBlur: hundreds of relay nodes are redrawn every frame.
-      ctx.globalAlpha = .16;
-      ctx.beginPath(); ctx.arc(node.x, node.y, node.radius + 2.2, 0, Math.PI * 2); ctx.fill();
-      ctx.globalAlpha = 1;
+      const opacity = ctx.globalAlpha;
+      ctx.globalAlpha = opacity * .12;
+      ctx.beginPath(); ctx.arc(node.x, node.y, node.radius + 1.5, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = opacity;
       ctx.beginPath(); ctx.arc(node.x, node.y, node.radius, 0, Math.PI * 2); ctx.fill();
       continue;
     }
-    ctx.beginPath(); ctx.arc(node.x, node.y, node.radius, 0, Math.PI * 2);
-    ctx.shadowBlur = selected ? 16 : active ? 11 : 7;
+    ctx.beginPath(); ctx.arc(node.x, node.y, node.radius + (selected || active ? Math.max(0, node.signal) * 1.4 : 0), 0, Math.PI * 2);
+    ctx.shadowBlur = selected ? 16 : active ? 12 : 3;
     ctx.shadowColor = ctx.fillStyle; ctx.fill(); ctx.shadowBlur = 0;
+    if (active && !reducedMotion) {
+      const age = timestamp - recall.startedAt - recallArrival(node.id);
+      if (age >= 0 && age < 700) {
+        ctx.strokeStyle = `rgba(250, 213, 151, ${(1 - age / 700) * .65})`;
+        ctx.lineWidth = .8;
+        ctx.beginPath(); ctx.arc(node.x, node.y, 4 + age / 55, 0, Math.PI * 2); ctx.stroke();
+      }
+    }
   }
-
+  ctx.globalAlpha = 1;
   ctx.textBaseline = "middle";
   for (const node of graphNodes.values()) {
     if (node.kind !== "hub" && node.id !== selectedId) continue;
     if (node.kind === "hub" && width < 700) continue;
     const short = node.label.length > 16 ? `${node.label.slice(0, 16)}…` : node.label;
     ctx.font = "10px Cascadia Code, Microsoft YaHei, sans-serif";
-    ctx.fillStyle = node.id === selectedId ? "#f4dcae" : node.kind === "hub" ? "#b7dec9" : "#b5b3d3";
+    ctx.fillStyle = node.id === selectedId ? "#f4dcae" : node.kind === "hub" ? currentQuery ? "#5c6d67" : "#b7dec9" : "#b5b3d3";
     ctx.textAlign = node.layer > graphLayers.length / 2 ? "right" : "left";
     const x = node.x + (ctx.textAlign === "right" ? -9 : 9);
     ctx.fillText(short, x, node.y);
   }
   ctx.textAlign = "left";
+  drawFeedbackPulse(timestamp);
 }
 
 function curveControls(from, to) {
   const dx = to.x - from.x, dy = to.y - from.y;
-  if (Math.abs(dx) > 1) return [{x: from.x + dx * .5, y: from.y}, {x: to.x - dx * .5, y: to.y}];
+  if (from.layer !== to.layer) return [{x: from.x + dx * .5, y: from.y}, {x: to.x - dx * .5, y: to.y}];
   // Same column: bow the synapse sideways so it stays visible.
   const bulge = 38 * (from.slot % 2 ? 1 : -1);
   return [{x: from.x + bulge, y: from.y + dy * .25}, {x: to.x + bulge, y: to.y - dy * .25}];
@@ -562,7 +762,7 @@ function rebuildSynapses() {
     const a = graphNodes.get(synapse.a), b = graphNodes.get(synapse.b);
     if (!a || !b) return;
     const [c1, c2] = curveControls(a, b);
-    const rgb = synapse.origin === "grown" ? "158, 226, 190" : synapse.w > synapse.base + .02 ? "239, 201, 135"
+    const rgb = synapse.origin === "grown" ? "239, 149, 165" : synapse.w > synapse.base + .02 ? "239, 201, 135"
       : synapse.w < synapse.base - .02 ? "229, 138, 160" : "170, 164, 222";
     synapseCurves.push({...synapse, a, b, c1, c2, rgb, key: `${synapse.a}|${synapse.b}`, phase: hash01(index * 3.7 + 1)});
   });
@@ -575,16 +775,71 @@ function strokeCurve(s) {
   ctx.stroke();
 }
 
-// Real synapses: thickness = learned weight; amber = strengthened, rose = weakened, mint = grown.
+function strokeRecallRoute(s, route, progress) {
+  const forward = route.from === s.a.id;
+  ctx.beginPath();
+  const start = forward ? s.a : s.b;
+  ctx.moveTo(start.x, start.y);
+  for (let step = 1; step <= 36; step++) {
+    const t = progress * step / 36;
+    const point = forward ? cubicPoint(s.a, s.c1, s.c2, s.b, t) : cubicPoint(s.b, s.c2, s.c1, s.a, t);
+    ctx.lineTo(point.x, point.y);
+  }
+  ctx.stroke();
+  return forward ? cubicPoint(s.a, s.c1, s.c2, s.b, progress) : cubicPoint(s.b, s.c2, s.c1, s.a, progress);
+}
+
+function drawFeedbackPulse(timestamp) {
+  if (!feedbackEvent?.changed || reducedMotion) return;
+  const age = timestamp - feedbackEvent.startedAt, node = graphNodes.get(feedbackEvent.id);
+  if (!node || age < 0 || age > 2500) return;
+  const down = feedbackEvent.action === "down", corrected = feedbackEvent.action === "correct";
+  const rgb = down ? "229, 138, 160" : corrected ? "161, 210, 191" : "239, 201, 135";
+  const progress = Math.min(1, age / 1500);
+  ctx.strokeStyle = `rgba(${rgb}, ${(1 - age / 2500) * .85})`;
+  ctx.lineWidth = 1.2;
+  ctx.beginPath(); ctx.arc(node.x, node.y, down ? 27 - progress * 22 : 5 + progress * 24, 0, Math.PI * 2); ctx.stroke();
+  if (corrected) { ctx.beginPath(); ctx.arc(node.x, node.y, 3 + progress * 16, 0, Math.PI * 2); ctx.stroke(); }
+  ctx.fillStyle = `rgba(${rgb}, ${1 - age / 2500})`;
+  ctx.font = "11px Cascadia Code, Microsoft YaHei, sans-serif";
+  ctx.textAlign = node.layer > graphLayers.length / 2 ? "right" : "left";
+  ctx.fillText(feedbackEvent.label, node.x + (ctx.textAlign === "right" ? -12 : 12), node.y - 17);
+  ctx.textAlign = "left";
+}
+
+// Real synapses: thickness follows learned weight and visual feedback emphasis.
 function drawSynapses(timestamp, activation) {
+  for (const [key, until] of flashes) if (until <= timestamp) flashes.delete(key);
   for (const s of synapseCurves) {
     const lit = s.a.id === selectedId || s.b.id === selectedId;
     const flash = (flashes.get(s.key) || 0) > timestamp;
-    const hot = (activation.get(s.a.id) || 0) + (activation.get(s.b.id) || 0) > .05;
-    const alpha = Math.min(.95, .16 + .5 * s.w + (lit ? .3 : hot ? .15 : 0));
-    ctx.strokeStyle = flash ? "rgba(158, 226, 190, .95)" : `rgba(${s.rgb}, ${alpha})`;
-    ctx.lineWidth = (.6 + s.w * 1.8) * (lit ? 1.4 : 1) + (flash ? 1.6 : 0);
+    const route = currentQuery && recall?.plan?.edges.get(s.key);
+    const progress = route ? Math.max(0, Math.min(1, (timestamp - recall.startedAt - recallMatchMs - (route.hop - 1) * recallHopMs) / recallHopMs)) : 0;
+    const transition = weightTransitions.get(s.key);
+    const mix = transition ? Math.min(1, (timestamp - transition.startedAt) / 700) : 1;
+    const weight = transition ? transition.from + (s.w - transition.from) * mix : s.w;
+    if (mix >= 1) weightTransitions.delete(s.key);
+    const alpha = Math.min(.85, lit ? .3 + .45 * weight : .055 + .15 * weight) * (currentQuery && !lit ? .16 : 1)
+      * (.1 + .9 * Math.min(s.a.retention, s.b.retention));
+    ctx.strokeStyle = flash ? "rgba(255, 153, 171, .95)" : `rgba(${s.rgb}, ${alpha})`;
+    ctx.lineWidth = (lit ? .65 + weight * 1.1 : .35 + weight * .6) + (flash ? 1.2 : 0);
     strokeCurve(s);
+    if (route && progress > 0) {
+      ctx.strokeStyle = `rgba(239, 201, 135, ${.3 + .5 * weight})`;
+      ctx.lineWidth = .65 + weight * 1.1;
+      const point = strokeRecallRoute(s, route, progress);
+      if (progress < 1 && !reducedMotion) {
+        ctx.fillStyle = "#fff1cc"; ctx.shadowColor = "#efc987"; ctx.shadowBlur = 9;
+        ctx.beginPath(); ctx.arc(point.x, point.y, 2.2, 0, Math.PI * 2); ctx.fill(); ctx.shadowBlur = 0;
+      }
+    }
+    if (feedbackEvent?.changed && !reducedMotion && timestamp - feedbackEvent.startedAt < 2500 && (s.a.id === feedbackEvent.id || s.b.id === feedbackEvent.id)) {
+      const down = feedbackEvent.action === "down", corrected = feedbackEvent.action === "correct";
+      const opacity = (1 - (timestamp - feedbackEvent.startedAt) / 2500) * .65;
+      ctx.strokeStyle = `rgba(${down ? "229, 138, 160" : corrected ? "161, 210, 191" : "239, 201, 135"}, ${opacity})`;
+      // Feedback briefly colours the incident edges; only actual learned weight changes affect thickness.
+      ctx.lineWidth = .65 + weight * 1.1; strokeCurve(s);
+    }
   }
   ghosts = ghosts.filter((ghost) => ghost.until > timestamp);
   for (const ghost of ghosts) {
@@ -594,6 +849,7 @@ function drawSynapses(timestamp, activation) {
   }
   if (reducedMotion) return;
   for (const s of synapseCurves) {
+    if (currentQuery) continue;
     const from = activation.get(s.a.id) || 0, to = activation.get(s.b.id) || 0;
     const strength = Math.max(from, to);
     if (strength < .05) continue;
@@ -619,7 +875,7 @@ function updateHud() {
   byId("hud-accuracy").title = stats.accuracy == null ? "需要两条相互连接、且都带反馈的记忆才能评估" : `${stats.accuracy_n} 条两端都带反馈的突触，权重朝正确方向变化的比例`;
   setText("link-count", stats.connections);
   const status = byId("hud-status");
-  status.textContent = learning ? "ACTIVE" : converged ? "CONVERGED" : "STANDBY";
+  status.textContent = learning ? "RUNNING" : converged ? "CONVERGED" : "STANDBY";
   status.className = learning ? "hud-active" : converged ? "hud-converged" : "hud-standby";
   setText("readout-generation", stats.generation);
   setText("readout-rate", stats.learning_rate.toFixed(3));
@@ -649,6 +905,8 @@ function applyDock() {
 function setDock(name, open) {
   dock[name] = open;
   applyDock();
+  layoutGraph();
+  drawChart();
   try { localStorage.setItem(dockKey, JSON.stringify(dock)); } catch { /* per-viewer convenience only */ }
   if (open && name === "search") setTimeout(() => byId("search-input").focus(), 260);
 }
@@ -671,7 +929,7 @@ function drawChart() {
   const maxLoss = Math.max(1e-6, ...history.map((row) => row.loss ?? 0));
   history.forEach((row, index) => {
     if (row.event === "learn") return;
-    c.strokeStyle = row.event === "grow" ? "rgba(158, 226, 190, .8)" : "rgba(229, 138, 160, .8)";
+    c.strokeStyle = row.event === "grow" ? "rgba(255, 153, 171, .8)" : "rgba(229, 138, 160, .8)";
     c.lineWidth = 1;
     c.beginPath(); c.moveTo(x(index), 1); c.lineTo(x(index), height - 1); c.stroke();
   });
@@ -738,6 +996,11 @@ function renderSynapseList(memory) {
 }
 
 function applyNetwork(network) {
+  const previous = new Map(atlas.network.synapses.map((edge) => [MemoryRecall.edgeKey(edge.a, edge.b), edge.w]));
+  if (!reducedMotion) for (const edge of network.synapses) {
+    const key = MemoryRecall.edgeKey(edge.a, edge.b), from = previous.get(key);
+    if (from != null && Math.abs(from - edge.w) > .00001) weightTransitions.set(key, {from, startedAt: performance.now()});
+  }
   atlas.network = network;
   rebuildSynapses();
   updateHud();
@@ -756,6 +1019,7 @@ async function learnTick() {
   try {
     const data = await post("/api/learn/step", {});
     applyNetwork(data.network);
+    if (currentQuery) await search(currentQuery, true);
     if (data.converged) {
       converged = true;
       setLearning(false);
@@ -768,6 +1032,7 @@ async function learnTick() {
 
 function toggleLearning() {
   if (!atlas?.network) return;
+  setDock("hud", true);
   if (learning) { setLearning(false); return; }
   const drifting = atlas.network.synapses.some((synapse) => Math.abs(synapse.w - synapse.base) > 1e-3);
   if (!atlas.network.stats.labeled && !drifting) {
@@ -780,6 +1045,7 @@ function toggleLearning() {
 
 async function evolveNetwork(action) {
   if (!atlas?.network) return;
+  setDock("hud", true);
   try {
     const previous = new Map(synapseCurves.map((synapse) => [synapse.key, synapse]));
     const data = await post("/api/evolve", {action});
@@ -788,6 +1054,7 @@ async function evolveNetwork(action) {
     for (const key of current) if (!previous.has(key)) flashes.set(key, now + 3000);
     for (const [key, synapse] of previous) if (!current.has(key)) ghosts.push({...synapse, until: now + 1800});
     applyNetwork(data.network);
+    if (currentQuery) await search(currentQuery, true);
     notify(action === "prune"
       ? (data.changed ? `已剪除 ${data.changed} 条弱突触` : `没有低于阈值的突触；先让网络学习几轮`)
       : (data.changed ? `进化：新增 ${data.changed} 条突触` : "进化完成，但暂无满足条件的新连接"));
@@ -802,7 +1069,7 @@ function graphPoint(event) {
 function nodeAt(point) {
   const x = (point.x - transform.x) / transform.scale;
   const y = (point.y - transform.y) / transform.scale;
-  return [...graphNodes.values()].reverse().find((node) => node.kind !== "relay" && Math.hypot(node.x - x, node.y - y) <= Math.max(11, node.radius + 4)) || null;
+  return [...graphNodes.values()].reverse().find((node) => Math.hypot(node.x - x, node.y - y) <= Math.max(9, node.radius + 3)) || null;
 }
 
 function zoom(factor, center = null) {
@@ -823,10 +1090,20 @@ canvas.addEventListener("pointerdown", (event) => {
   pointer = {start: graphPoint(event), previous: graphPoint(event), moved: false};
 });
 canvas.addEventListener("pointermove", (event) => {
-  if (!pointer) return;
   const point = graphPoint(event);
+  if (!pointer) {
+    const next = nodeAt(point)?.id || null;
+    if (next !== hoveredId) {
+      hoveredId = next;
+      canvas.style.cursor = next ? "pointer" : "grab";
+      updateProbe();
+      drawGraph(performance.now());
+    }
+    return;
+  }
   if (Math.hypot(point.x - pointer.start.x, point.y - pointer.start.y) > 4) pointer.moved = true;
   if (pointer.moved) {
+    if (hoveredId) { hoveredId = null; updateProbe(); }
     transform.x += point.x - pointer.previous.x;
     transform.y += point.y - pointer.previous.y;
     staticDirty = true;
@@ -838,7 +1115,10 @@ canvas.addEventListener("pointerup", (event) => {
   if (!pointer) return;
   if (!pointer.moved) {
     const node = nodeAt(graphPoint(event));
-    if (node?.kind === "memory") selectMemory(node.id);
+    if (node?.kind === "memory" || node?.kind === "relay") {
+      const memory = memoryForNode(node);
+      if (memory) selectMemory(memory.id);
+    }
     if (node?.kind === "hub") {
       setDock("search", true);
       byId("search-input").value = node.label;
@@ -848,6 +1128,9 @@ canvas.addEventListener("pointerup", (event) => {
   pointer = null;
 });
 canvas.addEventListener("pointercancel", () => { pointer = null; });
+canvas.addEventListener("pointerleave", () => {
+  if (!pointer && hoveredId) { hoveredId = null; updateProbe(); drawGraph(performance.now()); }
+});
 canvas.addEventListener("wheel", (event) => {
   event.preventDefault();
   zoom(event.deltaY < 0 ? 1.12 : 1 / 1.12, graphPoint(event));
@@ -876,6 +1159,20 @@ byId("search-form").addEventListener("submit", (event) => {
   event.preventDefault();
   search(byId("search-input").value).catch((error) => notify(error.message));
 });
+byId("quick-search").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const value = byId("quick-search-input").value;
+  search(value).then((applied) => {
+    if (applied && !ranking.length && value.trim()) notify("没有匹配记忆，请换个关键词");
+  }).catch((error) => notify(error.message));
+});
+document.querySelectorAll(".quick-chip").forEach((button) => button.addEventListener("click", () => {
+  byId("quick-search-input").value = button.dataset.query;
+  byId("quick-search").requestSubmit();
+}));
+byId("recall-results").addEventListener("click", () => setDock("search", true));
+byId("exit-recall").addEventListener("click", exitRecall);
+byId("quick-exit-recall").addEventListener("click", exitRecall);
 let debounce;
 byId("search-input").addEventListener("input", () => {
   clearTimeout(debounce);
@@ -935,6 +1232,12 @@ document.querySelectorAll("[data-dock]").forEach((button) => button.addEventList
   setDock(name, !dock[name]);
 }));
 document.addEventListener("keydown", (event) => {
+  if (event.isComposing) return;
+  if (event.key === "Escape" && currentQuery && !document.querySelector("dialog[open]") && !event.target.closest?.("textarea")) {
+    event.preventDefault();
+    exitRecall();
+    return;
+  }
   if (event.ctrlKey || event.metaKey || event.altKey || event.target.closest?.("input, textarea, button, select, summary, dialog")) return;
   if (event.key === "/") { event.preventDefault(); setDock("search", true); }
   else if (event.code === "Space") { event.preventDefault(); toggleLearning(); }
@@ -944,6 +1247,21 @@ byId("boost-button").addEventListener("click", () => changeFeedback("boost"));
 byId("down-button").addEventListener("click", () => changeFeedback("down"));
 byId("pin-button").addEventListener("click", () => changeFeedback("pin"));
 byId("reset-button").addEventListener("click", () => changeFeedback("reset"));
+byId("renew-memory").addEventListener("click", () => {
+  if (selectedId) renewMemory(selectedId).then(() => notify("记忆已重新启用，寿命重新计时")).catch((error) => notify(error.message));
+});
+byId("decay-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = byId("decay-save");
+  button.disabled = true;
+  try {
+    const days = Number(byId("decay-days").value);
+    await post("/api/settings", {decay_days: days});
+    await loadState();
+    notify(days ? `消散时间已设为 ${days} 天` : "已关闭自动消散");
+  } catch (error) { notify(error.message); }
+  finally { button.disabled = false; }
+});
 byId("save-correction").addEventListener("click", () => {
   const correction = byId("correction-input").value.trim();
   if (!correction) { notify("请输入修正内容；如需清除修正，请使用重置调整"); return; }
@@ -954,10 +1272,22 @@ applyDock();
 new ResizeObserver(() => { layoutGraph(); drawChart(); }).observe(canvas.parentElement);
 if (!reducedMotion) {
   let lastFrame = 0;
-  const animate = (time) => { if (!document.hidden && time - lastFrame > 45) { drawGraph(time); lastFrame = time; } requestAnimationFrame(animate); };
+  const animate = (time) => {
+    if (!document.hidden && time - lastFrame > 45 && (atlas?.count || currentQuery || selectedId || ghosts.length || flashes.size)) {
+      drawGraph(time);
+      lastFrame = time;
+    }
+    requestAnimationFrame(animate);
+  };
   requestAnimationFrame(animate);
 }
 loadState().catch((error) => {
   setText("source-status", `加载失败：${error.message}`);
   notify(`加载失败：${error.message}`);
 });
+// Re-evaluate elapsed time while the page is open, without renewing any memory.
+setInterval(() => {
+  if (atlas && !document.hidden && !feedbackBusy && !document.activeElement?.closest("textarea, input")) {
+    search(currentQuery, true).catch(() => {});
+  }
+}, 60000);

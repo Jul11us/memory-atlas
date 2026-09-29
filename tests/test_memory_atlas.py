@@ -94,7 +94,7 @@ class AtlasTests(unittest.TestCase):
         cursor_dir.mkdir(parents=True)
         cursor_file = cursor_dir / "style.mdc"
         cursor_file.write_text("---\ndescription: style\n---\n# Cursor preference\nKeep answers concise.", encoding="utf-8")
-        workspace = self.root / "Desktop" / "metrik"
+        workspace = self.root / "Desktop" / "sample-app"
         workspace.mkdir(parents=True)
         project_claude = workspace / "CLAUDE.md"
         project_claude.write_text("# Project conventions\nKeep tests focused.", encoding="utf-8")
