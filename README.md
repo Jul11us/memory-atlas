@@ -1,7 +1,7 @@
 <div align="center">
   <img src="assets/memory-atlas.svg" alt="Memory Atlas logo" width="88" height="88">
   <h1>Memory Atlas</h1>
-  <p><strong>本地 AI 记忆图谱 · Local AI Memory Network</strong></p>
+  <p><strong>本地记忆与项目规则图谱 · Local Memory & Project Rules Graph</strong></p>
   <p>
     <a href="#中文">简体中文</a> ·
     <a href="#english">English</a> ·
@@ -18,9 +18,9 @@
 
 ## 中文
 
-Memory Atlas 是一个运行在本机的 AI 记忆浏览与检索工具。它把你主动选择的持久记忆文件整理成一张可搜索、可反馈、可观察学习过程的关联图谱，帮助你在不同 AI 工具留下的资料之间找到线索。
+Memory Atlas 是一个在本机运行的浏览与检索工具，将本机可访问的 Codex 记忆摘要，以及 Claude Code、Cursor、Gemini CLI 等工具使用的记忆或项目规则文件整理成关联图谱。Codex 来源默认启用；其他来源由用户选择导入。你可以用关键词检索、手动反馈与修正；反馈会影响检索排序，手动运行“学习”步骤后还可观察关联权重如何调整。这里的“学习”是图谱反馈原型，不代表训练底层 AI 模型。
 
-Memory Atlas 只能读取运行它的这台电脑能够访问到的持久记忆和规则文件。项目文件能否被找到，取决于文件所在位置、是否已同步到本机，以及配置的扫描目录；与底层模型是在本地还是云端运行无关。纯云端工作区里的文件若没有同步或导出到本机，本地程序就无法读取。Memory Atlas 不读取聊天记录、不调用云端 API，也不会把图谱写回其他 AI 工具。
+能否找到文件取决于它们是否在这台电脑上可访问，以及扫描目录如何配置；与底层模型在本地还是云端运行无关。纯云端工作区中的文件需要先同步或导出到本机。程序不会主动扫描会话数据库或 `JSONL` 聊天日志，但手动导入的文本文件内容可能进入图谱。它不调用云端 API，也不修改来源文件或其他工具的记忆。
 
 ### 快速开始
 
@@ -38,7 +38,7 @@ python3 memory_atlas.py
 
 ### 功能
 
-- **记忆图谱：** 按项目浏览已导入记忆，并查看记忆之间的文本关联。
+- **关联图谱：** 按项目浏览已导入条目，并查看条目之间的文本关联。
 - **本地检索：** 支持中英文关键词匹配，并沿关联连接扩散激活相关记忆。
 - **反馈与修正：** 为记忆升权、降权、固定或保存修正，观察反馈如何影响后续召回。
 - **学习与进化：** 检视突触权重、学习曲线、网络进化和弱连接剪枝；运行状态保存在本机。
@@ -67,7 +67,7 @@ python memory_atlas.py --workspace "D:\\code" --workspace "/mnt/work/app"
 ### 隐私与数据
 
 - 服务仅绑定 `127.0.0.1`，仅供这台电脑访问；页面不加载外部脚本、字体或 API。
-- 来源文件只读，不会被复制、修改或删除。搜索词、来源选择与本地反馈保存在 `data/feedback.sqlite3`。
+- 来源文件只读，不会被复制、修改或删除。来源选择、自定义文件夹路径、反馈与图谱权重保存在 `data/feedback.sqlite3`；搜索词不保存在数据库中。
 - `data/` 已加入 Git 忽略规则；提交仓库时不会包含本机数据库。
 - 只导入你有权读取并希望加入本地图谱的文件。`AGENTS.md`、规则和 `GEMINI.md` 属于工具指令文件，不等同于 AI 产品内部的记忆。
 - 检索使用本地关键词匹配，不提供向量语义检索。页面里的神经元、突触和学习是便于检查关联与反馈的原型模型，不是语言模型的真实训练或神经元结构。
@@ -84,9 +84,9 @@ python -m unittest discover -s tests -v
 
 ## English
 
-Memory Atlas is a local browser app for exploring and searching persistent AI memory files. It organizes sources you choose into a searchable association graph, with feedback controls and a visible learning prototype to help you trace related notes across tools.
+Memory Atlas is a local browser app that organizes accessible Codex memory summaries and the memory or project rule files used by tools such as Claude Code, Cursor, and Gemini CLI into an association graph. Codex is enabled by default; you choose whether to import other sources. You can search by keyword, give manual feedback, and correct entries. Feedback affects search ranking; after you run a learning step, you can also inspect changes to connection weights. This “learning” is a graph feedback prototype, not training of the underlying AI model.
 
-Memory Atlas can read persistent memory and rule files only when they are accessible from the computer running it. Whether project files can be found depends on where those files live, whether they are synced locally, and which directories are configured for scanning. It does not depend on whether the underlying model runs locally or in the cloud. Files available only inside a remote cloud workspace cannot be read by this local app unless they are synced or exported to this computer. Memory Atlas does not read chat histories, call cloud APIs, or write its graph back to other AI tools.
+Whether files can be found depends on their accessibility from this computer and the configured scan directories; it does not depend on whether the underlying model runs locally or in the cloud. Files kept only in a remote workspace must first be synced or exported here. The app does not proactively scan conversation databases or `JSONL` chat logs, though the contents of text files you import manually may enter the graph. It does not call cloud APIs or modify source files or other tools' memories.
 
 ### Quick start
 
@@ -104,7 +104,7 @@ Then visit <http://127.0.0.1:8765>. You can also run `python start_website.py` t
 
 ### Features
 
-- **Memory graph:** Browse imported memories by project and inspect text-based connections.
+- **Association graph:** Browse imported entries by project and inspect text-based connections.
 - **Local search:** Match Chinese and English keywords, then follow associations to related memories.
 - **Feedback and corrections:** Boost, lower, pin, or correct a memory and see how feedback affects later retrieval.
 - **Learning prototype:** Inspect connection weights, learning history, graph evolution, and weak-edge pruning. State is stored locally.
@@ -133,7 +133,7 @@ python memory_atlas.py --workspace "D:\\code" --workspace "/mnt/work/app"
 ### Privacy and data
 
 - The service binds to `127.0.0.1` and is available only on your computer. The page loads no external scripts, fonts, or APIs.
-- Source files are read-only: they are not copied, modified, or deleted. Source selections and local feedback are stored in `data/feedback.sqlite3`.
+- Source files are read-only: they are not copied, modified, or deleted. Source selections, custom folder paths, feedback, and graph weights are stored in `data/feedback.sqlite3`; search queries are not stored in the database.
 - `data/` is ignored by Git, so your local database is not part of repository commits.
 - Import only files you are allowed to read and want in your local graph. `AGENTS.md`, tool rules, and `GEMINI.md` are instruction files; they are not the tools' internal memory stores.
 - Search uses local keyword matching rather than vector search. Neurons, synapses, and learning describe an inspectable association prototype, not the actual training or neural structure of a language model.
