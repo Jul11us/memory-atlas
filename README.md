@@ -20,7 +20,7 @@
 
 Memory Atlas 是一个运行在本机的 AI 记忆浏览与检索工具。它把你主动选择的持久记忆文件整理成一张可搜索、可反馈、可观察学习过程的关联图谱，帮助你在不同 AI 工具留下的资料之间找到线索。
 
-数据留在本机，原始文件只读。它不会读取聊天记录、调用云端 API，也不会改变 Codex、Claude、Cursor 或 Gemini 自己的记忆召回方式。
+Memory Atlas 只能读取运行它的这台电脑能够访问到的持久记忆和规则文件。项目文件能否被找到，取决于文件所在位置、是否已同步到本机，以及配置的扫描目录；与底层模型是在本地还是云端运行无关。纯云端工作区里的文件若没有同步或导出到本机，本地程序就无法读取。Memory Atlas 不读取聊天记录、不调用云端 API，也不会把图谱写回其他 AI 工具。
 
 ### 快速开始
 
@@ -86,7 +86,7 @@ python -m unittest discover -s tests -v
 
 Memory Atlas is a local browser app for exploring and searching persistent AI memory files. It organizes sources you choose into a searchable association graph, with feedback controls and a visible learning prototype to help you trace related notes across tools.
 
-Your data stays on your computer, and original files are read-only. Memory Atlas does not read chat histories, call cloud APIs, or change how Codex, Claude, Cursor, or Gemini retrieve their own memories.
+Memory Atlas can read persistent memory and rule files only when they are accessible from the computer running it. Whether project files can be found depends on where those files live, whether they are synced locally, and which directories are configured for scanning. It does not depend on whether the underlying model runs locally or in the cloud. Files available only inside a remote cloud workspace cannot be read by this local app unless they are synced or exported to this computer. Memory Atlas does not read chat histories, call cloud APIs, or write its graph back to other AI tools.
 
 ### Quick start
 
