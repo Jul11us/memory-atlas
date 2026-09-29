@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PUBLIC_FILES = {
     '.gitignore', '.github/workflows/check.yml', 'README.md', 'docs/integration.md',
     'assets/memory-atlas.svg', 'assets/demo-preview.jpg', 'memory_atlas.py',
+    'assets/demo-recall.jpg', 'assets/demo-inspector.jpg', 'assets/demo-decay.jpg',
     'start_website.py', '一键启动.bat', 'static/app.js', 'static/index.html',
     'static/styles.css', 'static/recall.js', 'tests/test_memory_atlas.py',
     'tests/test_recall.cjs', 'tests/test_decay.py', 'examples/recall.py',
@@ -41,7 +42,7 @@ def main() -> None:
         if not path.is_file():
             continue
         if path.suffix == '.jpg':
-            # Only the fictional demo screenshot is permitted; inspect its pixels separately.
+            # Only the reviewed fictional demo screenshots are permitted; inspect pixels separately.
             if path.read_bytes()[:3] != b'\xff\xd8\xff':
                 findings.append(f'{filename}: invalid JPEG')
             continue

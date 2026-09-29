@@ -9,6 +9,33 @@
 
 *截图来自隔离的虚构演示数据 / Screenshot uses isolated, fictional demo data.*
 
+<details>
+<summary>查看更多虚构演示截图 / More fictional demo screenshots</summary>
+
+### 关键词召回与关联路径 / Recall and association paths
+
+![Fictional demo: deployment recall with direct matches and associated memories](assets/demo-recall.jpg)
+
+*虚构演示数据：检索 deployment，展示直接匹配、关联背景和退出回忆入口。 Fictional demo: keyword hits, associated context, and the exit control.*
+
+### 记忆详情与反馈 / Memory details and feedback
+
+![Fictional demo: inspecting a deployment decision and reinforcing its recall weight](assets/demo-inspector.jpg)
+
+*虚构演示数据：查看部署决定、来源背景、召回权重及升权反馈。 Fictional demo: inspect a deployment decision, its weight, lifetime, and reinforcement feedback.*
+
+### 自定义消散与到期列表 / Adjustable decay and expired memories
+
+![Fictional demo: a 60-day decay policy and an expired memory awaiting renewal](assets/demo-decay.jpg)
+
+*虚构演示数据：将消散时间设为 60 天，并用模拟的未使用时间展示“已消散”列表；默认仍为 90 天。 Fictional demo: a custom 60-day policy and simulated inactivity; the application default remains 90 days.*
+
+这三张截图均来自独立演示服务。正文、项目和反馈是虚构示例，演示来源使用通用临时目录；没有加载个人记忆或个人数据库。
+
+All three screenshots use an isolated demo service, fictional notes/projects/feedback, and a generic temporary source directory. Personal memory and personal databases were not loaded.
+
+</details>
+
 ## 中文
 
 Memory Atlas 是一个本机运行的记忆检索服务和图谱界面。它把你选择的 AI 工具记忆、项目规则和 Markdown 笔记组织起来，让你或自己的 Agent 在回答问题之前找回相关背景、决定与偏好。
