@@ -20,6 +20,15 @@ local/
 exports/
 backups/
 screenshots/
+# Local recording, narration, and production files are never public source.
+/video/
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.mp3
+*.wav
+*.srt
 *.log
 .venv/
 .codex/

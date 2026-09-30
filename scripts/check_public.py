@@ -17,6 +17,7 @@ PUBLIC_FILES = {
     'start_website.py', '一键启动.bat', 'static/app.js', 'static/index.html',
     'static/styles.css', 'static/recall.js', 'tests/test_memory_atlas.py',
     'tests/test_recall.cjs', 'tests/test_decay.py', 'examples/recall.py',
+    'memory_atlas_mcp.py', 'tests/test_mcp.py',
     'examples/demo-memories/memory_summary.md', 'examples/demo-memories/MEMORY.md',
     'scripts/check_public.py',
 }

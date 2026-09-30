@@ -107,6 +107,10 @@
 /* Pull-out dock: the left panels stay tucked away until opened from the top bar (desktop only; phones keep them in the page flow). */
 .dock-close{display:none}
 .dock-toggle.is-active{color:#11121a;background:var(--violet);border-color:var(--violet)}
+.names-toggle{display:inline-flex;align-items:center;justify-content:center;gap:6px}
+.names-toggle svg{flex:none}
+.names-toggle [hidden]{display:none}
+.names-toggle.is-active{color:#11121a;background:var(--mint);border-color:var(--mint)}
 .dock-toggle.is-live{color:var(--mint);border-color:var(--mint)}
 .dock-toggle.is-active.is-live{color:#11121a;background:var(--mint)}
 @media(max-width:700px){.dock-toggle{display:none}}

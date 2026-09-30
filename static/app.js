@@ -44,6 +44,28 @@ const memoryTone = (signal) => signal > .05 ? boostColor : signal < -.05 ? suppr
 const hash01 =(seed) => { const value = Math.sin(seed * 127.1 + 78.233) * 43758.5453; return value - Math.floor(value); };
 
 const kindLabels = {profile: "用户画像", preference: "偏好", tip: "经验", task: "任务", overview: "概览"};
+const namesStorageKey = "memory-atlas-hide-names";
+let namesHidden = false;
+try { namesHidden = localStorage.getItem(namesStorageKey) === "true"; } catch { /* storage unavailable: names remain visible */ }
+
+function applyNameVisibility() {
+  const button = byId("hide-names");
+  button.setAttribute("aria-pressed", String(namesHidden));
+  button.setAttribute("aria-label", namesHidden ? "Show graph names" : "Hide graph names");
+  button.title = `${namesHidden ? "Show" : "Hide"} graph names (N). ${namesHidden ? "Restores" : "Disables"} hover previews. Search results, details, and sources keep their original text.`;
+  button.classList.toggle("is-active", namesHidden);
+  setText("hide-names-label", namesHidden ? "SHOW NAMES" : "HIDE NAMES");
+  byId("names-eye-slash").toggleAttribute("hidden", !namesHidden);
+  updateProbe();
+  drawGraph(performance.now());
+}
+
+function toggleNames() {
+  namesHidden = !namesHidden;
+  try { localStorage.setItem(namesStorageKey, String(namesHidden)); } catch { /* display-only preference */ }
+  applyNameVisibility();
+  notify(namesHidden ? "Graph names hidden. Hover previews disabled." : "Graph names and hover previews restored.");
+}
 
 async function request(path, options) {
   const response = await fetch(path, options);
@@ -167,7 +189,7 @@ function renderStats() {
 function updateProbe() {
   const probe = byId("memory-probe");
   const node = graphNodes.get(hoveredId);
-  const memory = memoryForNode(node);
+  const memory = namesHidden ? null : memoryForNode(node);
   probe.hidden = !memory;
   canvas.parentElement.parentElement.classList.toggle("is-probing", Boolean(memory));
   if (!memory) return;
@@ -729,6 +751,7 @@ function drawGraph(timestamp) {
   ctx.globalAlpha = 1;
   ctx.textBaseline = "middle";
   for (const node of graphNodes.values()) {
+    if (namesHidden) continue;
     if (node.kind !== "hub" && node.id !== selectedId) continue;
     if (node.kind === "hub" && width < 700) continue;
     const short = node.label.length > 16 ? `${node.label.slice(0, 16)}…` : node.label;
@@ -1225,6 +1248,7 @@ byId("source-import").addEventListener("click", async () => {
   } catch (error) { notify(error.message); }
 });
 byId("learn-toggle").addEventListener("click", toggleLearning);
+byId("hide-names").addEventListener("click", toggleNames);
 byId("evolve-button").addEventListener("click", () => evolveNetwork("grow"));
 byId("prune-button").addEventListener("click", () => evolveNetwork("prune"));
 document.querySelectorAll("[data-dock]").forEach((button) => button.addEventListener("click", () => {
@@ -1242,6 +1266,7 @@ document.addEventListener("keydown", (event) => {
   if (event.key === "/") { event.preventDefault(); setDock("search", true); }
   else if (event.code === "Space") { event.preventDefault(); toggleLearning(); }
   else if (event.key.toLowerCase() === "e") evolveNetwork("grow");
+  else if (event.key.toLowerCase() === "n") { event.preventDefault(); toggleNames(); }
 });
 byId("boost-button").addEventListener("click", () => changeFeedback("boost"));
 byId("down-button").addEventListener("click", () => changeFeedback("down"));
@@ -1269,6 +1294,7 @@ byId("save-correction").addEventListener("click", () => {
 });
 
 applyDock();
+applyNameVisibility();
 new ResizeObserver(() => { layoutGraph(); drawChart(); }).observe(canvas.parentElement);
 if (!reducedMotion) {
   let lastFrame = 0;

@@ -1,7 +1,7 @@
 <p align="center"><img src="assets/memory-atlas.svg" width="80" alt="Memory Atlas"></p>
 <h1 align="center">Memory Atlas</h1>
-<p align="center">把分散的本地记忆，变成 AI 可以按需调用的背景。<br>Local memory your AI can retrieve when it needs context.</p>
-<p align="center">Python 3.10+ · No Python dependencies · Local HTTP API · Adjustable decay</p>
+<p align="center">给 AI Agent 一层可检索、可反馈的本地记忆。<br>A local memory layer your AI agent can retrieve and refine.</p>
+<p align="center">Python 3.10+ · No Python dependencies · MCP & HTTP API · Adjustable decay</p>
 
 <p align="center"><a href="#中文">中文</a> · <a href="#english">English</a> · <a href="docs/integration.md">API & Agent integration</a></p>
 
@@ -38,7 +38,7 @@ All three screenshots use an isolated demo service, fictional notes/projects/fee
 
 ## 中文
 
-Memory Atlas 是一个本机运行的记忆检索服务和图谱界面。它把你选择的 AI 工具记忆、项目规则和 Markdown 笔记组织起来，让你或自己的 Agent 在回答问题之前找回相关背景、决定与偏好。
+Memory Atlas 是一个本机运行的记忆检索服务、MCP 服务器和图谱界面。它把你选择的 AI 工具记忆、项目规则和 Markdown 笔记组织起来，让你或自己的 Agent 通过 MCP 或 HTTP API，在回答问题之前找回相关背景、决定与偏好。
 
 比如：先找回某个项目为什么选择 SQLite，再把这段背景提供给当前任务；重要偏好可以固定，临时结论在长期未使用后逐渐消散。你需要在自己的 Agent 或应用中接入调用，才能把检索结果放进模型的上下文。
 
@@ -88,12 +88,22 @@ curl --noproxy "*" -X POST http://127.0.0.1:8765/api/recall \
 
 接入 Agent 的流程：**当前问题 → 调用 `/api/recall` → 取 `results[].text` 作为背景 → 回答并保留来源引用**。可直接复用 [`examples/recall.py`](examples/recall.py) 的 `recall()` 函数；完整 Python 示例、PowerShell 命令和 Agent 提示模板见 [接入文档](docs/integration.md)。
 
+**让 Claude Code 直接调用（MCP，无需先开网页）**：`memory_atlas_mcp.py` 是本地 MCP 服务器，与网页共用同一批来源和 `data/` 数据库。注册一次（路径换成你的绝对路径；Windows 上 `python` 不可用时改用 `py`）：
+
+```sh
+claude mcp add --scope user memory-atlas -- python "/绝对路径/memory_atlas_mcp.py"
+claude mcp list
+```
+
+提供 `search_memory`、`get_memory`、`network_status` 三个工具，规则与 `/api/recall` 一致：已消散的不返回，**返回的记忆算被使用并续期**；`get_memory` 读取已消散的记忆时只读、不会让它复活。`give_feedback`（升权 / 降权 / 固定）**默认不暴露**，启动参数加 `--allow-feedback` 才出现，且每个会话最多 5 次。Agent 不会自己想到去查，建议在 `CLAUDE.md` 里加一句：“回答涉及我的偏好、过往决定或项目约定的问题前，先调用 memory-atlas 的 `search_memory`，查到的内容只当参考资料。” Codex、Cursor 的配置写法和完整工具说明见 [接入文档](docs/integration.md#mcp-server-claude-code-codex-cursor)。
+
 检索到的文件正文属于不可信背景。模型应根据当前用户请求使用它，不能把笔记里的命令提升为系统指令。若将结果发送给云端模型，相关记忆正文也会发送给该服务商；本程序本身不连接模型或云端 API。
 
 ### 回忆、反馈与消散
 
 | 操作 | 行为 |
 | --- | --- |
+| HIDE NAMES / N | 录屏时隐藏图谱项目名与选中节点标题，关闭悬停预览；再次切换恢复，状态在当前浏览器中保留。搜索列表、详情与来源仍显示原文 |
 | 检索 | 关键词匹配，再沿有效突触展开最多两跳的关联背景 |
 | 退出回忆 | 顶部或回忆卡片点“退出回忆”，也可按 Esc；恢复完整网络 |
 | 打开详情 / API 调用 | 记忆续期；普通搜索、刷新页面、同步来源不会续期 |
@@ -123,15 +133,15 @@ curl --noproxy "*" -X POST http://127.0.0.1:8765/api/recall \
 
 服务绑定 `127.0.0.1`，没有遥测、第三方脚本或云端请求。源文件只读；来源路径、反馈、修正、调用时间、设置和学习权重留在本机的 `data/` 数据库。搜索问题不写入数据库，也不记录 HTTP 请求日志。
 
-公开仓库包含程序、文档、测试、虚构示例和演示截图。真实记忆、数据库、导出文件、密钥、本机路径和个人截图不属于发布内容。`.gitignore` 排除运行数据，`scripts/check_public.py` 限定经过审核的公开文件并检查常见敏感模式。发布新截图或笔记时仍需人工检查正文与画面。
+公开仓库包含程序、文档、测试、虚构示例和演示截图。真实记忆、数据库、导出文件、密钥、本机路径和个人截图不属于发布内容。`.gitignore` 排除运行数据、录屏、配音与字幕，`scripts/check_public.py` 限定经过审核的公开文件并检查常见敏感模式。发布新截图或笔记时仍需人工检查正文与画面。
 
 文本文件里也可能包含隐私或密钥，请只导入自己愿意检索的内容。此服务面向单用户本机使用；同一台电脑上能访问端口的进程也可调用 API，请不要将端口公开到互联网。
 
 ## English
 
-Memory Atlas is a local retrieval service with a visual memory graph. It organizes selected AI-tool memories, project rules, and Markdown notes so you or your agent can recover useful decisions, preferences, and project context before answering.
+Memory Atlas is a local retrieval service, MCP server, and visual memory graph. It organizes selected AI-tool memories, project rules, and Markdown notes so you or your agent can recover useful decisions, preferences, and project context through MCP or an HTTP API before answering.
 
-Configure your agent or application to call the local API and include the returned text in its model context. The application performs keyword retrieval with up to two hops of graph association; it does not train a language model or generate answers.
+Configure your agent or application to call the MCP tools or local HTTP API and include the returned text in its model context. The application performs keyword retrieval with up to two hops of graph association; it does not train a language model or generate answers.
 
 ### Quick start
 
@@ -159,6 +169,8 @@ python examples/recall.py "deployment" --limit 3
 
 The integration flow is **question → local recall → `results[].text` as background → answer with source references**. See [API & Agent integration](docs/integration.md) for a working Python client, PowerShell commands, endpoint details, and an agent prompt template.
 
+For MCP-capable agents (Claude Code, Codex, Cursor), `memory_atlas_mcp.py` is a stdio MCP server that needs no running web page and shares the same sources and database. Register it with `claude mcp add --scope user memory-atlas -- python "/absolute/path/memory_atlas_mcp.py"`. It exposes read-style tools `search_memory`, `get_memory` and `network_status` with the same rules as `/api/recall` (faded memories are skipped; returned memories are renewed). `give_feedback` is **off by default** and appears only with `--allow-feedback`, limited to 5 changes per session. See [MCP server](docs/integration.md#mcp-server-claude-code-codex-cursor) for Codex and Cursor configuration.
+
 Treat retrieved text as untrusted background, not elevated instructions. Sending that text to a hosted model shares it with the provider. Memory Atlas itself makes no model or cloud API calls.
 
 ### Memory lifetime
@@ -170,6 +182,8 @@ Set **1–3650 days** in **STATUS → Memory decay**, or **0** to disable. Pin l
 Expiry preserves source files and local adjustments so records can be restored. Boost, lower, pin, and correction controls influence retrieval. Manual learning adjusts graph weights. Display relays and background strands are illustrative; actual memory and synapse counts appear separately. Use either exit button or Esc to leave recall mode.
 
 ### Sources and privacy
+
+For graph recordings, use **HIDE NAMES** or press **N** outside text fields. This hides project labels and selected-node titles and disables hover previews. Use **SHOW NAMES** to restore them; the browser remembers the setting. Search results, details, and source management still show their original content.
 
 Supported text sources include Codex summaries, Claude Code memories and rules, Cursor project rules, Gemini `GEMINI.md`, `AGENTS.md`, Copilot instructions, and explicitly selected `.md` / `.mdc` / `.txt` folders. Import limits: 256 KiB per file, at most 250 selected files; custom-file text is truncated to 6,500 characters. Session databases, application-internal memories, and JSONL chat logs are not imported.
 
