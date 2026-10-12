@@ -1,7 +1,8 @@
 <p align="center"><img src="assets/memory-atlas.svg" width="80" alt="Memory Atlas"></p>
 <h1 align="center">Memory Atlas</h1>
-<p align="center">给 AI Agent 一层可检索、可反馈的本地记忆。<br>A local memory layer your AI agent can retrieve and refine.</p>
-<p align="center">Python 3.10+ · No Python dependencies · MCP & HTTP API · Adjustable decay</p>
+<p align="center">把本机记忆与项目规则变成可追溯的 Agent 背景。<br>Turn local memories and project rules into traceable context for AI agents.</p>
+<p align="center">网页浏览与反馈 · MCP / HTTP 按需召回 · 预览后导出到 Claude Code<br>Browse & give feedback · Recall via MCP / HTTP · Preview & export to Claude Code</p>
+<p align="center">Python 3.10+ · Standard library only · Adjustable decay</p>
 
 <p align="center"><a href="#中文">中文</a> · <a href="#english">English</a> · <a href="docs/integration.md">API & Agent integration</a></p>
 
@@ -38,9 +39,9 @@ All three screenshots use an isolated demo service, fictional notes/projects/fee
 
 ## 中文
 
-Memory Atlas 是一个本机运行的记忆检索服务、MCP 服务器和图谱界面。它把你选择的 AI 工具记忆、项目规则和 Markdown 笔记组织起来，让你或自己的 Agent 通过 MCP 或 HTTP API，在回答问题之前找回相关背景、决定与偏好。
+Memory Atlas 是一个本机运行的记忆检索服务、MCP 服务器和图谱界面。它把本机可访问的 Codex 记忆摘要，以及你启用的其他记忆、项目规则和 Markdown 笔记组织成关联图谱。你可以在网页中浏览和反馈，让自己的 Agent 通过 MCP 或 HTTP API 按需召回，也可以先预览，再把选定记忆导出到 Claude Code 的规则文件。
 
-比如：先找回某个项目为什么选择 SQLite，再把这段背景提供给当前任务；重要偏好可以固定，临时结论在长期未使用后逐渐消散。你需要在自己的 Agent 或应用中接入调用，才能把检索结果放进模型的上下文。
+比如：先找回某个项目为什么选择 SQLite，再把这段背景提供给当前任务；重要偏好可以固定，临时结论在长期未使用后逐渐消散。MCP / HTTP 召回需要你在 Agent 或应用中接入调用；Claude Code 导出则会把预览过的内容写入指定规则文件，供之后的会话读取。
 
 ### 先体验，再接入自己的记忆
 
@@ -153,9 +154,9 @@ claude mcp list
 
 ## English
 
-Memory Atlas is a local retrieval service, MCP server, and visual memory graph. It organizes selected AI-tool memories, project rules, and Markdown notes so you or your agent can recover useful decisions, preferences, and project context through MCP or an HTTP API before answering.
+Memory Atlas is a local retrieval service, MCP server, and visual memory graph. It organizes locally accessible Codex memory summaries and other memory, project rule, and Markdown files you enable into an association graph. Browse and give feedback in the web UI, let your agent recall relevant context through MCP or HTTP, or preview selected memories before exporting them to a Claude Code rules file.
 
-Configure your agent or application to call the MCP tools or local HTTP API and include the returned text in its model context. The application performs keyword retrieval with up to two hops of graph association; it does not train a language model or generate answers.
+MCP and HTTP recall require you to configure an agent or application to call them. Claude Code export writes the previewed content to a specified rules file for later sessions. Retrieval uses keyword matching with up to two hops of graph association; the application does not train a language model or generate answers.
 
 ### Quick start
 
