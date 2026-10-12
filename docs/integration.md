@@ -108,7 +108,7 @@ If your agent has a tool registry, expose `recall(query, limit=5)` as a tool. Ke
 
 This is explicit integration: nothing is injected into Codex, Claude, or Cursor automatically. For agents that speak MCP, use the bundled stdio server below instead of writing your own tool. A remote/cloud agent cannot reach your computer's `127.0.0.1`; run a local integration process rather than exposing this unauthenticated port publicly.
 
-## MCP server (Claude Code, Codex, Cursor)
+## MCP server (Claude Code, Codex, Cursor, Gemini CLI)
 
 `memory_atlas_mcp.py` is a stdio MCP server built on the standard library. It does not need the web page to be running and does not open a network port. It reads the same sources and the same `data/` database as the web page, so sources, corrections, feedback, learned synapse weights and the lifetime setting apply to what an agent recalls immediately (source files are re-read every 30 seconds).
 
@@ -132,6 +132,14 @@ Cursor, in `.cursor/mcp.json`:
 ```json
 {"mcpServers": {"memory-atlas": {"command": "python", "args": ["/absolute/path/to/memory_atlas_mcp.py"]}}}
 ```
+
+Gemini CLI, in the **user-level** `~/.gemini/settings.json` (keep your existing settings and merge the `mcpServers` entry):
+
+```json
+{"mcpServers": {"memory-atlas": {"command": "python", "args": ["/absolute/path/to/memory_atlas_mcp.py"], "trust": false}}}
+```
+
+You can also register it with `gemini mcp add -s user memory-atlas python "/absolute/path/to/memory_atlas_mcp.py"`. Check it with `gemini mcp list` or `/mcp` inside Gemini CLI. This configures the local **Gemini CLI agent**, not the Gemini model or web chat. The server starts on the same machine, and the tool result is shared with Gemini only when the agent calls it. [Gemini CLI's MCP documentation](https://geminicli.com/docs/tools/mcp-server/) describes the supported configuration and scope.
 
 | Tool | Behaviour |
 | --- | --- |
@@ -173,8 +181,11 @@ POST bodies must be JSON with `Content-Type: application/json`.
 | `POST /api/export/claude/preview` | `{"scope":"global","limit":20,"only_project":""}`; `scope` `"project"` also needs `"project":"absolute/path"` | Builds the Claude Code rules file from current weights and returns `content`, `digest`, `target`, `count`, `lines`, `omitted`, `exists`, `owned`, `changed`; writes nothing |
 | `POST /api/export/claude/write` | Same body plus `"digest"` from the preview | Writes `memory-atlas.md` only if the content still matches the preview and the target is absent or was created by Memory Atlas; refused in `--demo` |
 | `POST /api/export/claude/remove` | `{"scope":"global"}` or `{"scope":"project","project":"..."}` | Deletes the exported file only if Memory Atlas created it |
+| `POST /api/export/cursor/preview` | `{"scope":"project","project":"absolute/path","limit":20,"only_project":""}` | Preview a Cursor `.mdc` project rule; returns `git_safe` and `git_message`; writes nothing |
+| `POST /api/export/cursor/write` | Same body plus preview `digest` | Writes `<project>/.cursor/rules/memory-atlas.mdc` only when the Git target is ignored and untracked, and the file is absent or Memory Atlas-owned; refused in `--demo` |
+| `POST /api/export/cursor/remove` | `{"scope":"project","project":"absolute/path"}` | Deletes only the Memory Atlas-owned Cursor rule |
 
-`GET /api/state` includes `claude_exports`: each written target with the exported memory IDs and `outdated: true` once later weighting, corrections or lifetime changes would produce different content.
+`GET /api/state` includes `claude_exports` and `cursor_exports`: each written target with exported memory IDs and `outdated: true` once later weighting, corrections or lifetime changes would produce different content. Cursor output uses `alwaysApply: false` with a description, so Cursor decides when to include it; use MCP for per-question retrieval. Cursor treats an included project rule as instruction context: review every exported source, since a line in a memory could affect the agent despite the export's background-data label. In a Git project, if the target is not already ignored, add the repository-root-relative equivalent of `.cursor/rules/memory-atlas.mdc*` to its local `.git/info/exclude` (covers the output and its temporary file). This local exclusion is not committed, and the exporter refuses a tracked target even when ignored.
 
 Feedback actions: `boost`, `down`, `pin`, `archive`, `correct`, `reset`. Corrections require `{"id":"...","action":"correct","correction":"accurate replacement text"}` (up to 2,000 characters). `archive` toggles manual exclusion independently of timed expiry.
 

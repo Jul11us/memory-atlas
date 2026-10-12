@@ -1249,8 +1249,24 @@ byId("source-import").addEventListener("click", async () => {
     notify(`已导入 ${atlas.count} 条记忆`);
   } catch (error) { notify(error.message); }
 });
-// --- export to Claude Code: preview first, write only what was previewed ---------------------
+// --- export to Claude Code or Cursor: preview first, write only what was previewed -----------
 let exportPreview = null;
+
+function exportKind() { return byId("export-target").value; }
+
+function syncExportTarget() {
+  const cursor = exportKind() === "cursor";
+  byId("export-kicker").textContent = cursor ? "EXPORT / CURSOR" : "EXPORT / CLAUDE CODE";
+  byId("export-heading").textContent = cursor ? "导出到 Cursor" : "导出到 Claude Code";
+  byId("export-intro").textContent = cursor
+    ? "将预览过的记忆写入这个项目的 Cursor 规则，供 Cursor 按需引用。Cursor 规则可能随项目提交；Git 项目必须先在本地忽略目标文件，Memory Atlas 才会写入。已消散、降权和来自 Cursor 规则本身的记忆不会导出。"
+    : "按当前权重挑出记忆，写成 Claude Code 后续会话会读取的规则文件。原记忆仍可调整，改动后需重新导出。降权、已消散和来自 Claude Code 本身的记忆不会导出。";
+  byId("export-global-choice").hidden = cursor;
+  byId("export-project-target").textContent = cursor
+    ? "项目/.cursor/rules/memory-atlas.mdc" : "项目/.claude/rules/memory-atlas.md";
+  if (cursor) document.querySelector('input[name=export-scope][value=project]').checked = true;
+  byId("export-project").hidden = document.querySelector("input[name=export-scope]:checked").value !== "project";
+}
 
 function exportOptions() {
   const scope = document.querySelector("input[name=export-scope]:checked").value;
@@ -1259,20 +1275,24 @@ function exportOptions() {
 }
 
 function renderExportButton() {
-  const outdated = (atlas?.claude_exports || []).some((item) => item.outdated || item.missing);
+  const outdated = [...(atlas?.claude_exports || []), ...(atlas?.cursor_exports || [])]
+    .some((item) => item.outdated || item.missing);
   const button = byId("export-button");
   button.classList.toggle("is-outdated", outdated);
-  button.title = outdated ? "权重或记忆有变化：已导出到 Claude Code 的文件需要重新导出" : "按权重导出到 Claude Code";
+  button.title = outdated ? "权重或记忆有变化：导出文件需要重新导出" : "预览并导出到 Claude Code 或 Cursor";
 }
 
 function renderExportNote(memory) {
-  const records = (atlas.claude_exports || []).filter((item) => item.ids.includes(memory.id));
+  const records = [
+    ...(atlas.claude_exports || []).map((item) => ({...item, agent: "Claude Code"})),
+    ...(atlas.cursor_exports || []).map((item) => ({...item, agent: "Cursor"})),
+  ].filter((item) => item.ids.includes(memory.id));
   const note = byId("memory-export");
   note.hidden = !records.length;
   if (!records.length) return;
-  const places = records.map((item) => item.scope === "global" ? "所有项目" : `项目 ${item.project_name}`).join("、");
+  const places = records.map((item) => `${item.agent} ${item.scope === "global" ? "所有项目" : `项目 ${item.project_name}`}`).join("、");
   const outdated = records.some((item) => item.outdated || item.missing);
-  note.textContent = `已导出到 Claude Code（${places}）。这里仍可升权、降权或修正${outdated ? "；权重已变化，到 EXPORT 重新导出即可更新" : "，改动后重新导出即可更新"}。`;
+  note.textContent = `已导出到 ${places}。这里仍可升权、降权或修正${outdated ? "；权重已变化，到 EXPORT 重新导出即可更新" : "，改动后重新导出即可更新"}。`;
   note.classList.toggle("is-outdated", outdated);
 }
 
@@ -1284,25 +1304,27 @@ function invalidateExportPreview(message) {
 
 function renderExportPreview(data) {
   exportPreview = data;
+  const cursor = exportKind() === "cursor";
   const preview = byId("export-preview");
   preview.hidden = false;
   preview.textContent = data.content;
   const parts = [`写入位置：${data.target}`, `${data.count} 条 · ${data.lines} 行`];
-  if (data.omitted) parts.push(`另有 ${data.omitted} 条超出 Claude Code 建议的长度，未写入`);
-  if (!data.count) parts.push("没有可导出的记忆：降权、已消散和来自 Claude Code 本身的记忆不导出");
+  if (data.omitted) parts.push(`另有 ${data.omitted} 条超出导出长度限制，未写入`);
+  if (!data.count) parts.push(`没有可导出的记忆：降权、已消散和来自 ${cursor ? "Cursor 规则" : "Claude Code"} 本身的记忆不导出`);
   if (data.exists && !data.owned) parts.push("目标位置已有同名文件，且不是 Memory Atlas 生成的，不会覆盖");
   else if (data.last_export) parts.push(data.changed ? "与上次导出相比有变化" : "与上次导出的内容一致");
-  if (data.scope === "project") parts.push("项目里的 .claude/rules 可能被提交到 git，公开仓库请改用“所有项目”");
+  if (cursor) parts.push(data.git_message);
+  else if (data.scope === "project") parts.push("项目里的 .claude/rules 可能被提交到 Git，公开仓库请改用“所有项目”");
   if (!data.enabled) parts.push("演示模式只预览，不写入");
   setText("export-meta", `${parts.join("。")}。`);
-  byId("export-write").disabled = !data.enabled || !data.count || (data.exists && !data.owned);
-  byId("export-write").textContent = data.exists && data.owned ? "更新 Claude Code 文件" : "写入 Claude Code";
+  byId("export-write").disabled = !data.enabled || !data.count || (data.exists && !data.owned) || (cursor && !data.git_safe);
+  byId("export-write").textContent = `${data.exists && data.owned ? "更新" : "写入"}${cursor ? " Cursor" : " Claude Code"}文件`;
   byId("export-remove").hidden = !(data.enabled && data.exists && data.owned);
 }
 
 async function previewExport() {
   try {
-    renderExportPreview(await post("/api/export/claude/preview", exportOptions()));
+    renderExportPreview(await post(`/api/export/${exportKind()}/preview`, exportOptions()));
   } catch (error) {
     invalidateExportPreview(error.message);
     byId("export-preview").hidden = true;
@@ -1315,6 +1337,7 @@ function openExportDialog() {
   const filter = byId("export-filter"), current = filter.value;
   filter.replaceChildren(new Option("全部项目", ""), ...atlas.hubs.map((hub) => new Option(hub.name, hub.name)));
   filter.value = atlas.hubs.some((hub) => hub.name === current) ? current : "";
+  syncExportTarget();
   byId("export-dialog").showModal();
   previewExport();
 }
@@ -1324,6 +1347,7 @@ byId("export-close").addEventListener("click", () => byId("export-dialog").close
 byId("export-form").addEventListener("submit", (event) => { event.preventDefault(); previewExport(); });
 byId("export-form").addEventListener("input", () => invalidateExportPreview("选项已改变，请点“预览”。"));
 byId("export-form").addEventListener("change", (event) => {
+  syncExportTarget();
   const project = document.querySelector("input[name=export-scope]:checked").value === "project";
   byId("export-project").hidden = !project;
   if (event.target.name === "export-scope" && project) { byId("export-project").focus(); return; }
@@ -1333,10 +1357,11 @@ byId("export-write").addEventListener("click", async () => {
   if (!exportPreview) return;
   byId("export-write").disabled = true;
   try {
-    const data = await post("/api/export/claude/write", {...exportOptions(), digest: exportPreview.digest});
+    const kind = exportKind();
+    const data = await post(`/api/export/${kind}/write`, {...exportOptions(), digest: exportPreview.digest});
     renderExportPreview(data);
     await loadState();
-    notify(`已写入 ${data.count} 条记忆；新开的 Claude Code 会话会读取它`);
+    notify(`已写入 ${data.count} 条记忆到 ${kind === "cursor" ? "Cursor 项目规则" : "Claude Code 规则"}`);
   } catch (error) {
     notify(error.message);
     await previewExport();
@@ -1345,11 +1370,12 @@ byId("export-write").addEventListener("click", async () => {
 byId("export-remove").addEventListener("click", async () => {
   if (!exportPreview || !window.confirm(`删除 ${exportPreview.target}？\n只删除 Memory Atlas 生成的这个文件，记忆本身和权重不受影响。`)) return;
   const {scope, project} = exportOptions();
+  const kind = exportKind();
   try {
-    await post("/api/export/claude/remove", {scope, project});
+    await post(`/api/export/${kind}/remove`, {scope, project});
     await loadState();
     await previewExport();
-    notify("已移除导出文件；之后新开的 Claude Code 会话不再读取这些记忆");
+    notify(`已移除 ${kind === "cursor" ? "Cursor" : "Claude Code"} 导出文件`);
   } catch (error) { notify(error.message); }
 });
 byId("learn-toggle").addEventListener("click", toggleLearning);

@@ -1,7 +1,7 @@
 <p align="center"><img src="assets/memory-atlas.svg" width="80" alt="Memory Atlas"></p>
 <h1 align="center">Memory Atlas</h1>
 <p align="center">把本机记忆与项目规则变成可追溯的 Agent 背景。<br>Turn local memories and project rules into traceable context for AI agents.</p>
-<p align="center">网页浏览与反馈 · MCP / HTTP 按需召回 · 预览后导出到 Claude Code<br>Browse & give feedback · Recall via MCP / HTTP · Preview & export to Claude Code</p>
+<p align="center">网页浏览与反馈 · MCP / HTTP 按需召回 · 预览后导出到 Claude Code / Cursor<br>Browse & give feedback · Recall via MCP / HTTP · Preview & export to Claude Code / Cursor</p>
 <p align="center">Python 3.10+ · Standard library only · Adjustable decay</p>
 
 <p align="center"><a href="#中文">中文</a> · <a href="#english">English</a> · <a href="docs/integration.md">API & Agent integration</a></p>
@@ -39,9 +39,9 @@ All three screenshots use an isolated demo service, fictional notes/projects/fee
 
 ## 中文
 
-Memory Atlas 是一个本机运行的记忆检索服务、MCP 服务器和图谱界面。它把本机可访问的 Codex 记忆摘要，以及你启用的其他记忆、项目规则和 Markdown 笔记组织成关联图谱。你可以在网页中浏览和反馈，让自己的 Agent 通过 MCP 或 HTTP API 按需召回，也可以先预览，再把选定记忆导出到 Claude Code 的规则文件。
+Memory Atlas 是一个本机运行的记忆检索服务、MCP 服务器和图谱界面。它把本机可访问的 Codex 记忆摘要，以及你启用的其他记忆、项目规则和 Markdown 笔记组织成关联图谱。你可以在网页中浏览和反馈，让自己的 Agent 通过 MCP 或 HTTP API 按需召回，也可以先预览，再把选定记忆导出到 Claude Code 或 Cursor 的规则文件。
 
-比如：先找回某个项目为什么选择 SQLite，再把这段背景提供给当前任务；重要偏好可以固定，临时结论在长期未使用后逐渐消散。MCP / HTTP 召回需要你在 Agent 或应用中接入调用；Claude Code 导出则会把预览过的内容写入指定规则文件，供之后的会话读取。
+比如：先找回某个项目为什么选择 SQLite，再把这段背景提供给当前任务；重要偏好可以固定，临时结论在长期未使用后逐渐消散。MCP / HTTP 召回需要你在 Agent 或应用中接入调用；规则导出则会把预览过的内容写入指定文件，供对应 Agent 使用。
 
 ### 先体验，再接入自己的记忆
 
@@ -96,7 +96,7 @@ claude mcp add --scope user memory-atlas -- python "/绝对路径/memory_atlas_m
 claude mcp list
 ```
 
-提供 `search_memory`、`get_memory`、`network_status` 三个工具，规则与 `/api/recall` 一致：已消散的不返回，**返回的记忆算被使用并续期**；`get_memory` 读取已消散的记忆时只读、不会让它复活。`give_feedback`（升权 / 降权 / 固定）**默认不暴露**，启动参数加 `--allow-feedback` 才出现，且每个会话最多 5 次。Agent 不会自己想到去查，建议在 `CLAUDE.md` 里加一句：“回答涉及我的偏好、过往决定或项目约定的问题前，先调用 memory-atlas 的 `search_memory`，查到的内容只当参考资料。” Codex、Cursor 的配置写法和完整工具说明见 [接入文档](docs/integration.md#mcp-server-claude-code-codex-cursor)。
+提供 `search_memory`、`get_memory`、`network_status` 三个工具，规则与 `/api/recall` 一致：已消散的不返回，**返回的记忆算被使用并续期**；`get_memory` 读取已消散的记忆时只读、不会让它复活。`give_feedback`（升权 / 降权 / 固定）**默认不暴露**，启动参数加 `--allow-feedback` 才出现，且每个会话最多 5 次。Agent 不会自己想到去查，建议在 Agent 的配置文件里加一句：“回答涉及我的偏好、过往决定或项目约定的问题前，先调用 memory-atlas 的 `search_memory`，查到的内容只当参考资料。” Codex、Cursor、Gemini CLI 的配置写法和完整工具说明见 [接入文档](docs/integration.md#mcp-server-claude-code-codex-cursor-gemini-cli)。
 
 检索到的文件正文属于不可信背景。模型应根据当前用户请求使用它，不能把笔记里的命令提升为系统指令。若将结果发送给云端模型，相关记忆正文也会发送给该服务商；本程序本身不连接模型或云端 API。
 
@@ -113,6 +113,12 @@ claude mcp list
 | 安全 | 写入的内容必须与预览一致，预览后权重有变化会要求重新预览。“移除导出文件”只删除本程序生成的那个文件。`--demo` 模式只预览、不写入 |
 
 规则文件里的内容会在**每次** Claude Code 会话中加载并发送给模型，它对 Claude 的影响比按需检索更大：只导出你愿意让 Claude 一直看到的记忆。写到项目里的 `.claude/rules` 可能被提交进 git，公开仓库请用“所有项目”。新开的 Claude Code 会话才会读到更新，可用 `/context` 确认已加载。
+
+### 导出到 Cursor 项目规则
+
+在 **EXPORT** 中选择“Cursor 项目规则”，填项目绝对路径，检查预览后写入 `<项目>/.cursor/rules/memory-atlas.mdc`。它是由 Cursor 判断相关性再加载的项目规则，不保证每次对话都加载；需要按问题实时查找时，请用 MCP。导出时会排除来自 Cursor 规则本身、已消散、降权及手动排除的记忆，文件也不会被再次导入。Cursor 会把加载的规则当作指令上下文，因此只选择可信来源并逐条审查预览。
+
+Cursor 项目规则可能被 Git 提交。对 Git 项目，如果目标还未被忽略，可在该仓库的**本地** `.git/info/exclude` 增加相对于仓库根目录的 `.cursor/rules/memory-atlas.mdc*`（同时忽略导出文件和临时文件）；程序还会拒绝写入已被 Git 跟踪的目标文件。预览不写文件；只会更新或删除自己生成的专用文件。被忽略只防止普通 Git 提交，不阻止 Cursor 使用该规则。Gemini CLI 可通过上方 MCP 按需查询，无需复制一份长期规则。
 
 ### 回忆、反馈与消散
 
@@ -154,9 +160,9 @@ claude mcp list
 
 ## English
 
-Memory Atlas is a local retrieval service, MCP server, and visual memory graph. It organizes locally accessible Codex memory summaries and other memory, project rule, and Markdown files you enable into an association graph. Browse and give feedback in the web UI, let your agent recall relevant context through MCP or HTTP, or preview selected memories before exporting them to a Claude Code rules file.
+Memory Atlas is a local retrieval service, MCP server, and visual memory graph. It organizes locally accessible Codex memory summaries and other memory, project rule, and Markdown files you enable into an association graph. Browse and give feedback in the web UI, let your agent recall relevant context through MCP or HTTP, or preview selected memories before exporting them to Claude Code or Cursor project rules.
 
-MCP and HTTP recall require you to configure an agent or application to call them. Claude Code export writes the previewed content to a specified rules file for later sessions. Retrieval uses keyword matching with up to two hops of graph association; the application does not train a language model or generate answers.
+MCP and HTTP recall require you to configure an agent or application to call them. Rule export writes the previewed content to a specified file for the target agent. Retrieval uses keyword matching with up to two hops of graph association; the application does not train a language model or generate answers.
 
 ### Quick start
 
@@ -184,7 +190,7 @@ python examples/recall.py "deployment" --limit 3
 
 The integration flow is **question → local recall → `results[].text` as background → answer with source references**. See [API & Agent integration](docs/integration.md) for a working Python client, PowerShell commands, endpoint details, and an agent prompt template.
 
-For MCP-capable agents (Claude Code, Codex, Cursor), `memory_atlas_mcp.py` is a stdio MCP server that needs no running web page and shares the same sources and database. Register it with `claude mcp add --scope user memory-atlas -- python "/absolute/path/memory_atlas_mcp.py"`. It exposes read-style tools `search_memory`, `get_memory` and `network_status` with the same rules as `/api/recall` (faded memories are skipped; returned memories are renewed). `give_feedback` is **off by default** and appears only with `--allow-feedback`, limited to 5 changes per session. See [MCP server](docs/integration.md#mcp-server-claude-code-codex-cursor) for Codex and Cursor configuration.
+For MCP-capable agents (Claude Code, Codex, Cursor, Gemini CLI), `memory_atlas_mcp.py` is a stdio MCP server that needs no running web page and shares the same sources and database. Register it with `claude mcp add --scope user memory-atlas -- python "/absolute/path/memory_atlas_mcp.py"`. It exposes read-style tools `search_memory`, `get_memory` and `network_status` with the same rules as `/api/recall` (faded memories are skipped; returned memories are renewed). `give_feedback` is **off by default** and appears only with `--allow-feedback`, limited to 5 changes per session. See [MCP server](docs/integration.md#mcp-server-claude-code-codex-cursor-gemini-cli) for Codex, Cursor and Gemini CLI configuration.
 
 Treat retrieved text as untrusted background, not elevated instructions. Sending that text to a hosted model shares it with the provider. Memory Atlas itself makes no model or cloud API calls.
 
@@ -193,6 +199,12 @@ Treat retrieved text as untrusted background, not elevated instructions. Sending
 **EXPORT** in the top bar writes your highest-weighted memories into a rules file that Claude Code loads at the start of every session: `~/.claude/rules/memory-atlas.md` (all projects) or `<project>/.claude/rules/memory-atlas.md`. You always see a preview first, and the write is refused if weights changed after the preview. Pinned memories come first; down-weighted, faded and archived memories, and memories that came from Claude Code's own files, are left out. Output stays under Claude Code's recommended 200 lines. Only this dedicated, marked file is ever written or removed; an existing file with that name that Memory Atlas did not create is never overwritten.
 
 Exporting does not freeze anything. The original memories stay in the graph and can still be boosted, demoted, pinned or corrected; the EXPORT button turns amber when the exported file no longer matches the current weights, and exporting again updates it. The export file is never re-imported as a new memory. Everything in it is sent to the model in every Claude Code session, so export only what you want Claude to see all the time, and prefer the all-projects location for public repositories. `--demo` previews but never writes.
+
+### Export to Cursor project rules
+
+Choose **Cursor project rules** in **EXPORT**, enter the project's absolute path, inspect the preview, then write `<project>/.cursor/rules/memory-atlas.mdc`. With `alwaysApply: false` and a description, Cursor decides when to include it; use MCP for per-question retrieval. Cursor treats an included rule as instruction context, so review the source text before export. Cursor's own rules, demoted, faded and archived memories are excluded, and the generated file is never re-imported.
+
+Project rules may be committed. In a Git project, if the target is not already ignored, add the repository-root-relative equivalent of `.cursor/rules/memory-atlas.mdc*` to its **local** `.git/info/exclude` (covering the output and temporary file); the exporter also refuses a tracked target. It only replaces or removes its own marked file. Ignoring prevents ordinary Git staging, while Cursor can still read the rule. Gemini CLI can query the same local MCP server without copying a standing rule.
 
 ### Memory lifetime
 

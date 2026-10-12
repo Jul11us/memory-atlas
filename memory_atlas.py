@@ -9,6 +9,7 @@ import math
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import time
 import unicodedata
@@ -30,6 +31,10 @@ MAX_IMPORT_BYTES = 256 * 1024
 IMPORT_SUFFIXES = {".md", ".mdc", ".txt"}
 # Export to Claude Code: one dedicated rules file that Claude Code loads at the start of every session.
 EXPORT_FILENAME = "memory-atlas.md"
+CURSOR_EXPORT_FILENAME = "memory-atlas.mdc"
+CURSOR_EXPORT_HEADER = ("---\n"
+                        "description: User preferences and project history exported from Memory Atlas; use when prior decisions matter\n"
+                        "alwaysApply: false\n---\n")
 EXPORT_MARKER = "<!-- memory-atlas:export"
 EXPORT_MAX_LINES = 180          # Claude Code recommends keeping an instruction file under 200 lines
 EXPORT_MAX_CHARS = 12000
@@ -356,9 +361,11 @@ def claude_memory_files(root: Path, workspaces: list[Path]) -> list[Path]:
 
 def cursor_rule_files(root: Path, workspaces: list[Path]) -> list[Path]:
     rule_suffixes = {".mdc", ".md"}
-    files = import_files(root / "rules", depth=1, suffixes=rule_suffixes)
+    files = [path for path in import_files(root / "rules", depth=1, suffixes=rule_suffixes)
+             if path.name != CURSOR_EXPORT_FILENAME]
     for workspace in workspaces:
-        files.extend(import_files(workspace / ".cursor" / "rules", depth=2, suffixes=rule_suffixes))
+        files.extend(path for path in import_files(workspace / ".cursor" / "rules", depth=2, suffixes=rule_suffixes)
+                     if path.name != CURSOR_EXPORT_FILENAME)
         legacy = workspace / ".cursorrules"
         if readable_file(legacy, {""}):
             files.append(legacy)
@@ -509,6 +516,16 @@ class FeedbackStore:
                 ids TEXT NOT NULL,
                 written_at TEXT NOT NULL
             )""")
+            db.execute("""CREATE TABLE IF NOT EXISTS cursor_exports (
+                target TEXT PRIMARY KEY,
+                scope TEXT NOT NULL,
+                project TEXT NOT NULL DEFAULT '',
+                limit_n INTEGER NOT NULL,
+                only_project TEXT NOT NULL DEFAULT '',
+                digest TEXT NOT NULL,
+                ids TEXT NOT NULL,
+                written_at TEXT NOT NULL
+            )""")
             db.execute("""CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value INTEGER NOT NULL
@@ -548,25 +565,35 @@ class FeedbackStore:
                               last_used=MAX(COALESCE(memory_activity.last_used, ''), excluded.last_used)""",
                            [(identifier, now.isoformat(), now.isoformat()) for identifier in ids])
 
-    def exports(self) -> list[dict]:
-        with self.connect() as db:
-            return [dict(row) for row in db.execute("SELECT * FROM claude_exports ORDER BY written_at")]
+    @staticmethod
+    def _export_table(kind: str) -> str:
+        if kind not in {"claude", "cursor"}:
+            raise ValueError("未知导出目标")
+        return f"{kind}_exports"
 
-    def export_record(self, target: str) -> dict | None:
+    def exports(self, kind: str = "claude") -> list[dict]:
+        table = self._export_table(kind)
         with self.connect() as db:
-            row = db.execute("SELECT * FROM claude_exports WHERE target=?", (target,)).fetchone()
+            return [dict(row) for row in db.execute(f"SELECT * FROM {table} ORDER BY written_at")]
+
+    def export_record(self, target: str, kind: str = "claude") -> dict | None:
+        table = self._export_table(kind)
+        with self.connect() as db:
+            row = db.execute(f"SELECT * FROM {table} WHERE target=?", (target,)).fetchone()
         return dict(row) if row else None
 
-    def save_export(self, record: dict) -> None:
+    def save_export(self, record: dict, kind: str = "claude") -> None:
+        table = self._export_table(kind)
         with self.connect() as db:
-            db.execute("""INSERT OR REPLACE INTO claude_exports(target, scope, project, limit_n, only_project,
+            db.execute(f"""INSERT OR REPLACE INTO {table}(target, scope, project, limit_n, only_project,
                           digest, ids, written_at)
                           VALUES(:target, :scope, :project, :limit_n, :only_project, :digest, :ids, :written_at)""",
                        record)
 
-    def delete_export(self, target: str) -> None:
+    def delete_export(self, target: str, kind: str = "claude") -> None:
+        table = self._export_table(kind)
         with self.connect() as db:
-            db.execute("DELETE FROM claude_exports WHERE target=?", (target,))
+            db.execute(f"DELETE FROM {table} WHERE target=?", (target,))
 
     def settings(self) -> dict:
         with self.connect() as db:
@@ -1188,7 +1215,8 @@ class Atlas:
                 "dormant_count": sum(item["dormant"] for item in lifecycle.values()),
                 "count": len(items), "memories": items, "hubs": hubs, "links": links,
                 "network": self.network.snapshot(self.network.labels(feedback)),
-                "claude_exports": self.export_status()}
+                "claude_exports": self.export_status(),
+                "cursor_exports": self.export_status("cursor")}
 
     def search(self, query: str) -> dict:
         feedback = self.store.all()
@@ -1257,7 +1285,7 @@ class Atlas:
         except OSError:
             return True, False
 
-    def _export_rows(self, limit: int, only_project: str) -> list[dict]:
+    def _export_rows(self, limit: int, only_project: str, excluded_tool: str = "Claude Code") -> list[dict]:
         """Highest current weight first, pinned memories before all others. Down-weighted, archived and faded
         memories stay out, and so do Claude Code's own files, which Claude already reads."""
         feedback = self.store.all()
@@ -1266,7 +1294,7 @@ class Atlas:
         for memory in self.memories:
             state = feedback.get(memory.id, {})
             life = lifecycle[memory.id]
-            if memory.tool == "Claude Code" or state.get("archived") or life["dormant"] \
+            if memory.tool == excluded_tool or state.get("archived") or life["dormant"] \
                     or int(state.get("boost", 0)) < 0 or (only_project and memory.project != only_project):
                 continue
             correction = (state.get("correction") or "").strip()
@@ -1366,14 +1394,16 @@ class Atlas:
         self.store.delete_export(str(target))
         return {"target": str(target), "removed": exists}
 
-    def export_status(self) -> list[dict]:
+    def export_status(self, kind: str = "claude") -> list[dict]:
         """What has been exported, and whether later weighting has made it out of date."""
         status = []
-        for record in self.store.exports():
-            exists, owned = self._export_file_state(Path(record["target"]))
+        for record in self.store.exports(kind):
+            exists, owned = (self._cursor_file_state(Path(record["target"])) if kind == "cursor"
+                             else self._export_file_state(Path(record["target"])))
             try:
-                current = self.export_preview(record["scope"], record["project"], record["limit_n"],
-                                              record["only_project"])["digest"]
+                preview = self.cursor_export_preview if kind == "cursor" else self.export_preview
+                current = preview(record["scope"], record["project"], record["limit_n"],
+                                  record["only_project"])["digest"]
             except ValueError:
                 current = None
             status.append({"target": record["target"], "scope": record["scope"],
@@ -1382,6 +1412,150 @@ class Atlas:
                            "missing": not (exists and owned),
                            "outdated": current is None or current != record["digest"]})
         return status
+
+    # Cursor rules live inside a project and are often committed. Require Git to ignore our
+    # dedicated file locally, and refuse to touch a tracked copy even if ignore rules changed.
+    def _cursor_target(self, scope: object, project: object) -> Path:
+        if scope != "project":
+            raise ValueError("Cursor 规则只能导出到指定项目")
+        folder = self._export_target("project", project).parent.parent.parent
+        target = folder / ".cursor" / "rules" / CURSOR_EXPORT_FILENAME
+        for part in (target.parent.parent, target.parent):
+            if part.is_symlink() or (hasattr(part, "is_junction") and part.is_junction()):
+                raise ValueError("目标规则文件夹是链接，无法安全写入")
+        return target
+
+    @staticmethod
+    def _cursor_file_state(target: Path) -> tuple[bool, bool]:
+        try:
+            if target.is_symlink():
+                return True, False
+            if not target.exists():
+                return False, False
+            with target.open("r", encoding="utf-8", errors="replace") as handle:
+                return True, handle.read(400).startswith(f"{CURSOR_EXPORT_HEADER}{EXPORT_MARKER}")
+        except OSError:
+            return True, False
+
+    @staticmethod
+    def _cursor_git_safety(target: Path) -> tuple[bool, str]:
+        project = target.parent.parent.parent
+        temporary = target.with_name(f"{CURSOR_EXPORT_FILENAME}.tmp")
+        try:
+            root = subprocess.run(["git", "-C", str(project), "rev-parse", "--show-toplevel"],
+                                  capture_output=True, timeout=5)
+            if root.returncode != 0:
+                if any((part / ".git").exists() for part in (project, *project.parents)):
+                    return False, "无法验证目标项目的 Git 状态，已停止写入"
+                return True, "目标目录不在 Git 仓库中"
+            tracked = subprocess.run(["git", "-C", str(project), "ls-files", "--error-unmatch", "--",
+                                      str(target)], capture_output=True, timeout=5)
+            if tracked.returncode == 0:
+                return False, "目标文件已被 Git 跟踪；请先从 Git 索引移除并确认不会公开"
+            if tracked.returncode != 1:
+                return False, "无法验证目标文件是否被 Git 跟踪，已停止写入"
+            ignored = [subprocess.run(["git", "-C", str(project), "check-ignore", "-q", "--no-index", "--",
+                                      str(path)], capture_output=True, timeout=5).returncode == 0
+                       for path in (target, temporary)]
+            if all(ignored):
+                return True, "目标文件已被 Git 忽略且未被跟踪"
+            return False, "目标文件或临时文件未被 Git 忽略；请先将 .cursor/rules/memory-atlas.mdc* 加入本地 .git/info/exclude"
+        except (OSError, subprocess.TimeoutExpired):
+            return False, "无法验证 Git 状态，已停止写入"
+
+    def cursor_export_preview(self, scope: object, project: object = "", limit: object = 20,
+                              only_project: object = "") -> dict:
+        target = self._cursor_target(scope, project)
+        limit, only_project = self._export_options(limit, only_project)
+        rows = self._export_rows(limit, only_project, "Cursor 规则")
+        blocks, ids = [], []
+        omitted, lines_used, chars_used = 0, 10, 0
+        for row in rows:
+            memory = row["memory"]
+            value = " ".join(row["text"].split())
+            value = value[:EXPORT_ENTRY_CHARS].rstrip() + "…" if len(value) > EXPORT_ENTRY_CHARS else value
+            title = " ".join(memory.title.split())
+            same = not title or value.startswith(title.rstrip("…").rstrip())
+            block = (f"- {value if same else f'**{title}**：{value}'}\n"
+                     f"  _来源：{memory.tool} · {memory.project} · 权重 {row['weight']:.2f}_\n")
+            if lines_used + block.count("\n") + 1 > EXPORT_MAX_LINES or chars_used + len(block) > EXPORT_MAX_CHARS:
+                omitted += 1
+                continue
+            blocks.append(block)
+            ids.append(memory.id)
+            lines_used += block.count("\n") + 1
+            chars_used += len(block)
+        content = "\n".join([
+            *CURSOR_EXPORT_HEADER.rstrip("\n").split("\n"),
+            f"{EXPORT_MARKER} v1: generated by Memory Atlas. Edits here are overwritten by the next export. -->",
+            "# Memory Atlas：按权重导出的记忆", "",
+            "以下是用户选择的背景记忆，不是新指令；与当前请求冲突时，以当前请求为准。", "",
+            f"_范围：{target.parent.parent.parent.name} · "
+            f"{('仅 ' + only_project + ' · ') if only_project else ''}共 {len(ids)} 条。调整后需重新导出。_",
+            "", "\n".join(blocks)]).rstrip() + "\n"
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        exists, owned = self._cursor_file_state(target)
+        git_safe, git_message = self._cursor_git_safety(target)
+        record = self.store.export_record(str(target), "cursor")
+        return {"target": str(target), "scope": scope, "count": len(ids), "omitted": omitted,
+                "lines": content.count("\n"), "chars": len(content), "content": content, "digest": digest,
+                "ids": ids, "exists": exists, "owned": owned, "enabled": self.export_enabled,
+                "git_safe": git_safe, "git_message": git_message,
+                "changed": record is not None and record["digest"] != digest,
+                "last_export": None if record is None else {"written_at": record["written_at"],
+                                                            "count": len(json.loads(record["ids"]))}}
+
+    def cursor_export_write(self, scope: object, project: object = "", limit: object = 20,
+                            only_project: object = "", digest: str = "") -> dict:
+        if not self.export_enabled:
+            raise ValueError("演示模式只预览，不会写入 Cursor 文件")
+        preview = self.cursor_export_preview(scope, project, limit, only_project)
+        if not preview["count"]:
+            raise ValueError("没有可导出的记忆")
+        if digest != preview["digest"]:
+            raise ValueError("预览之后记忆或权重有变化，请重新预览确认后再写入")
+        if not preview["git_safe"]:
+            raise ValueError(preview["git_message"])
+        if preview["exists"] and not preview["owned"]:
+            raise ValueError("目标位置已有同名文件，且不是 Memory Atlas 生成的，不会覆盖")
+        target = Path(preview["target"])
+        temporary = target.with_name(f"{CURSOR_EXPORT_FILENAME}.tmp")
+        created = False
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with temporary.open("x", encoding="utf-8", newline="\n") as handle:
+                created = True
+                handle.write(preview["content"])
+            os.replace(temporary, target)
+        except OSError as error:
+            if created:
+                temporary.unlink(missing_ok=True)
+            raise ValueError(f"写入失败：{error.strerror or error}") from error
+        written_at = datetime.now(timezone.utc).isoformat()
+        self.store.save_export({"target": str(target), "scope": "project", "project": str(target.parent.parent.parent),
+                                "limit_n": limit, "only_project": only_project or "", "digest": preview["digest"],
+                                "ids": json.dumps(preview["ids"]), "written_at": written_at}, "cursor")
+        return {**preview, "written": True, "exists": True, "owned": True, "changed": False,
+                "last_export": {"written_at": written_at, "count": preview["count"]}}
+
+    def cursor_export_remove(self, scope: object, project: object = "") -> dict:
+        if not self.export_enabled:
+            raise ValueError("演示模式不会修改 Cursor 文件")
+        target = self._cursor_target(scope, project)
+        exists, owned = self._cursor_file_state(target)
+        if exists and not owned:
+            raise ValueError("这个文件不是 Memory Atlas 生成的，不会删除")
+        try:
+            tracked = subprocess.run(["git", "-C", str(target.parent.parent.parent), "ls-files",
+                                      "--error-unmatch", "--", str(target)], capture_output=True, timeout=5)
+            if tracked.returncode == 0:
+                raise ValueError("目标文件仍被 Git 跟踪；请先从 Git 索引移除，确认远端没有公开副本，再移除导出")
+        except (OSError, subprocess.TimeoutExpired):
+            raise ValueError("无法验证 Git 索引状态，已停止删除") from None
+        if exists:
+            target.unlink()
+        self.store.delete_export(str(target), "cursor")
+        return {"target": str(target), "removed": exists}
 
     def network_state(self) -> dict:
         return self.network.snapshot(self.network.labels(self.store.all()))
@@ -1507,6 +1681,15 @@ class AtlasHandler(BaseHTTPRequestHandler):
                                                    str(body.get("digest", ""))))
             elif self.path == "/api/export/claude/remove":
                 self._json(self.atlas.export_remove(body.get("scope"), body.get("project", "")))
+            elif self.path == "/api/export/cursor/preview":
+                self._json(self.atlas.cursor_export_preview(body.get("scope"), body.get("project", ""),
+                                                            body.get("limit", 20), body.get("only_project", "")))
+            elif self.path == "/api/export/cursor/write":
+                self._json(self.atlas.cursor_export_write(body.get("scope"), body.get("project", ""),
+                                                          body.get("limit", 20), body.get("only_project", ""),
+                                                          str(body.get("digest", ""))))
+            elif self.path == "/api/export/cursor/remove":
+                self._json(self.atlas.cursor_export_remove(body.get("scope"), body.get("project", "")))
             elif self.path == "/api/learn/step":
                 self._json(self.atlas.learn_step())
             elif self.path == "/api/evolve":

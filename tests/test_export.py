@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -9,7 +10,8 @@ from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from memory_atlas import EXPORT_FILENAME, EXPORT_MARKER, Atlas, AtlasHandler, ThreadingHTTPServer
+from memory_atlas import (CURSOR_EXPORT_FILENAME, EXPORT_FILENAME, EXPORT_MARKER,
+                          Atlas, AtlasHandler, ThreadingHTTPServer)
 
 SUMMARY = """v1
 ## User Profile
@@ -199,6 +201,64 @@ class ExportTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.atlas.export_remove("global")
         self.assertFalse(self.target.exists())
+        project = self.root / "demo-cursor"
+        project.mkdir()
+        cursor_preview = self.atlas.cursor_export_preview("project", str(project))
+        self.assertFalse(cursor_preview["enabled"])
+        with self.assertRaises(ValueError):
+            self.atlas.cursor_export_write("project", str(project), digest=cursor_preview["digest"])
+        self.assertFalse((project / ".cursor").exists())
+
+    def test_cursor_project_export_requires_git_ignore_and_never_overwrites_user_file(self):
+        project = self.root / "cursor-project"
+        project.mkdir()
+        subprocess.run(["git", "init", "-q", str(project)], check=True)
+        target = project / ".cursor" / "rules" / CURSOR_EXPORT_FILENAME
+        preview = self.atlas.cursor_export_preview("project", str(project))
+        self.assertFalse(preview["git_safe"])
+        with self.assertRaisesRegex(ValueError, "未被 Git 忽略"):
+            self.atlas.cursor_export_write("project", str(project), digest=preview["digest"])
+        self.assertFalse(target.exists())
+        (project / ".git" / "info" / "exclude").write_text(".cursor/rules/memory-atlas.mdc\n", encoding="utf-8")
+        self.assertFalse(self.atlas.cursor_export_preview("project", str(project))["git_safe"])
+        (project / ".git" / "info" / "exclude").write_text(".cursor/rules/memory-atlas.mdc*\n", encoding="utf-8")
+        preview = self.atlas.cursor_export_preview("project", str(project))
+        self.assertTrue(preview["git_safe"])
+        self.assertTrue(preview["content"].startswith("---\ndescription: User preferences and project history exported from Memory Atlas"))
+        written = self.atlas.cursor_export_write("project", str(project), digest=preview["digest"])
+        self.assertTrue(written["written"])
+        self.assertEqual(self.atlas.state()["cursor_exports"][0]["project_name"], "cursor-project")
+        target.write_text("# My own rule\n", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.atlas.cursor_export_write("project", str(project), digest=preview["digest"])
+        with self.assertRaises(ValueError):
+            self.atlas.cursor_export_remove("project", str(project))
+        self.assertEqual(target.read_text(encoding="utf-8"), "# My own rule\n")
+
+    def test_cursor_export_is_not_reimported_and_tracked_file_is_blocked(self):
+        project = self.root / "cursor-project"
+        project.mkdir()
+        subprocess.run(["git", "init", "-q", str(project)], check=True)
+        target = project / ".cursor" / "rules" / CURSOR_EXPORT_FILENAME
+        (project / ".git" / "info" / "exclude").write_text(".cursor/rules/memory-atlas.mdc*\n", encoding="utf-8")
+        preview = self.atlas.cursor_export_preview("project", str(project))
+        self.atlas.cursor_export_write("project", str(project), digest=preview["digest"])
+        (target.parent / "my-rule.mdc").write_text("# Project rule\nUse the local database.\n", encoding="utf-8")
+        self.atlas.extra_folders.append(project)
+        self.atlas.select_sources(["codex", "cursor"])
+        self.assertNotIn(CURSOR_EXPORT_FILENAME, {Path(item.source).name for item in self.atlas.memories})
+        self.assertNotIn("Use the local database", self.atlas.cursor_export_preview("project", str(project))["content"])
+        self.atlas.feedback(self.memory("SQLite").id, "boost")
+        self.assertTrue(self.atlas.state()["cursor_exports"][0]["outdated"])
+        subprocess.run(["git", "-C", str(project), "add", "-f", "--", str(target)], check=True)
+        blocked = self.atlas.cursor_export_preview("project", str(project))
+        self.assertFalse(blocked["git_safe"])
+        with self.assertRaisesRegex(ValueError, "已被 Git 跟踪"):
+            self.atlas.cursor_export_write("project", str(project), digest=blocked["digest"])
+        with self.assertRaisesRegex(ValueError, "仍被 Git 跟踪"):
+            self.atlas.cursor_export_remove("project", str(project))
+        subprocess.run(["git", "-C", str(project), "rm", "--cached", "-q", "--", str(target)], check=True)
+        self.assertTrue(self.atlas.cursor_export_remove("project", str(project))["removed"])
 
     def test_http_endpoints(self):
         handler = type("TestHandler", (AtlasHandler,), {"atlas": self.atlas})
@@ -223,6 +283,14 @@ class ExportTests(unittest.TestCase):
                 post("/api/export/claude/preview", {"scope": "global", "limit": "many"})
             self.assertEqual(raised.exception.code, 400)
             self.assertTrue(post("/api/export/claude/remove", {"scope": "global"})["removed"])
+            project = self.root / "cursor-project"
+            project.mkdir()
+            body = {"scope": "project", "project": str(project), "limit": 3}
+            cursor_preview = post("/api/export/cursor/preview", body)
+            self.assertTrue(cursor_preview["git_safe"])
+            self.assertTrue(post("/api/export/cursor/write", {**body, "digest": cursor_preview["digest"]})["written"])
+            self.assertTrue((project / ".cursor" / "rules" / CURSOR_EXPORT_FILENAME).exists())
+            self.assertTrue(post("/api/export/cursor/remove", body)["removed"])
         finally:
             server.shutdown()
             server.server_close()
