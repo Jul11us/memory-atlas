@@ -170,6 +170,11 @@ POST bodies must be JSON with `Content-Type: application/json`.
 | `POST /api/sync` | `{}` | Re-read selected sources; does not renew existing clocks |
 | `POST /api/learn/step` | `{}` | One step of graph-weight learning |
 | `POST /api/evolve` | `{"action":"grow"}` or `{"action":"prune"}` | Grow or prune graph connections |
+| `POST /api/export/claude/preview` | `{"scope":"global","limit":20,"only_project":""}`; `scope` `"project"` also needs `"project":"absolute/path"` | Builds the Claude Code rules file from current weights and returns `content`, `digest`, `target`, `count`, `lines`, `omitted`, `exists`, `owned`, `changed`; writes nothing |
+| `POST /api/export/claude/write` | Same body plus `"digest"` from the preview | Writes `memory-atlas.md` only if the content still matches the preview and the target is absent or was created by Memory Atlas; refused in `--demo` |
+| `POST /api/export/claude/remove` | `{"scope":"global"}` or `{"scope":"project","project":"..."}` | Deletes the exported file only if Memory Atlas created it |
+
+`GET /api/state` includes `claude_exports`: each written target with the exported memory IDs and `outdated: true` once later weighting, corrections or lifetime changes would produce different content.
 
 Feedback actions: `boost`, `down`, `pin`, `archive`, `correct`, `reset`. Corrections require `{"id":"...","action":"correct","correction":"accurate replacement text"}` (up to 2,000 characters). `archive` toggles manual exclusion independently of timed expiry.
 

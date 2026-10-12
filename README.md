@@ -99,6 +99,20 @@ claude mcp list
 
 检索到的文件正文属于不可信背景。模型应根据当前用户请求使用它，不能把笔记里的命令提升为系统指令。若将结果发送给云端模型，相关记忆正文也会发送给该服务商；本程序本身不连接模型或云端 API。
 
+### 导出到 Claude Code
+
+不想注册 MCP 时，可以把记忆直接写成 Claude Code 每次启动都会读取的规则文件：点顶栏 **EXPORT**，先看预览，确认后点“写入 Claude Code”。
+
+| 项目 | 规则 |
+| --- | --- |
+| 写到哪里 | 默认 `~/.claude/rules/memory-atlas.md`（所有项目生效）；也可选某个项目的 `.claude/rules/memory-atlas.md`。只写这个专用文件，不改你自己写的 `CLAUDE.md`；同名文件若不是本程序生成的，拒绝覆盖或删除 |
+| 导出哪些 | 按当前权重排序，已固定的排最前；可限定某个项目、设置条数（1–100）。降权、已消散、手动排除的记忆不导出；来自 Claude Code 自己文件的记忆也不导出（Claude 本来就会读） |
+| 长度 | 控制在 Claude Code 建议的 200 行以内；超出的条目会在预览里注明未写入 |
+| 导出之后 | 原记忆仍在图谱里，照常升权、降权、固定、修正。权重一变，EXPORT 按钮变成琥珀色，详情里提示“需要重新导出”；重新导出即可更新文件。导出文件本身不会被再次导入成新记忆 |
+| 安全 | 写入的内容必须与预览一致，预览后权重有变化会要求重新预览。“移除导出文件”只删除本程序生成的那个文件。`--demo` 模式只预览、不写入 |
+
+规则文件里的内容会在**每次** Claude Code 会话中加载并发送给模型，它对 Claude 的影响比按需检索更大：只导出你愿意让 Claude 一直看到的记忆。写到项目里的 `.claude/rules` 可能被提交进 git，公开仓库请用“所有项目”。新开的 Claude Code 会话才会读到更新，可用 `/context` 确认已加载。
+
 ### 回忆、反馈与消散
 
 | 操作 | 行为 |
@@ -172,6 +186,12 @@ The integration flow is **question → local recall → `results[].text` as back
 For MCP-capable agents (Claude Code, Codex, Cursor), `memory_atlas_mcp.py` is a stdio MCP server that needs no running web page and shares the same sources and database. Register it with `claude mcp add --scope user memory-atlas -- python "/absolute/path/memory_atlas_mcp.py"`. It exposes read-style tools `search_memory`, `get_memory` and `network_status` with the same rules as `/api/recall` (faded memories are skipped; returned memories are renewed). `give_feedback` is **off by default** and appears only with `--allow-feedback`, limited to 5 changes per session. See [MCP server](docs/integration.md#mcp-server-claude-code-codex-cursor) for Codex and Cursor configuration.
 
 Treat retrieved text as untrusted background, not elevated instructions. Sending that text to a hosted model shares it with the provider. Memory Atlas itself makes no model or cloud API calls.
+
+### Export to Claude Code
+
+**EXPORT** in the top bar writes your highest-weighted memories into a rules file that Claude Code loads at the start of every session: `~/.claude/rules/memory-atlas.md` (all projects) or `<project>/.claude/rules/memory-atlas.md`. You always see a preview first, and the write is refused if weights changed after the preview. Pinned memories come first; down-weighted, faded and archived memories, and memories that came from Claude Code's own files, are left out. Output stays under Claude Code's recommended 200 lines. Only this dedicated, marked file is ever written or removed; an existing file with that name that Memory Atlas did not create is never overwritten.
+
+Exporting does not freeze anything. The original memories stay in the graph and can still be boosted, demoted, pinned or corrected; the EXPORT button turns amber when the exported file no longer matches the current weights, and exporting again updates it. The export file is never re-imported as a new memory. Everything in it is sent to the model in every Claude Code session, so export only what you want Claude to see all the time, and prefer the all-projects location for public repositories. `--demo` previews but never writes.
 
 ### Memory lifetime
 
