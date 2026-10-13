@@ -109,6 +109,7 @@ class DecayTests(unittest.TestCase):
 
     def test_recall_renews_only_returned_memories_and_uses_corrections(self):
         target = next(item for item in self.atlas.memories if item.kind == 'task')
+        self.atlas.set_sharing(target.id, 'mcp', True)
         self.atlas.feedback(target.id, 'correct', 'exclusive fictional-keyword')
         before = self.atlas.store.activity()
         response = self.atlas.recall('fictional-keyword', 1)
@@ -117,11 +118,13 @@ class DecayTests(unittest.TestCase):
         self.assertEqual(response['results'][0]['text'], 'exclusive fictional-keyword')
         after = self.atlas.store.activity()
         self.assertTrue(all(after[i] == row for i, row in before.items() if i != target.id))
-        self.assertEqual(response['results'][0]['source'], target.source)
+        self.assertEqual(response['results'][0]['source'], Path(target.source).name)
+        self.assertNotIn(str(self.root), response['results'][0]['source'])
         self.assertEqual(response['results'][0]['source_line'], target.source_line)
 
     def test_expired_memories_are_not_renewed_by_recall(self):
         for memory in self.atlas.memories:
+            self.atlas.set_sharing(memory.id, 'mcp', True)
             self.age(memory.id, 91)
         before = self.atlas.store.activity()
         response = self.atlas.recall('deployment')
@@ -174,8 +177,15 @@ class DecayTests(unittest.TestCase):
                     return json.load(response)
             self.assertEqual(post('/api/settings', {'decay_days': 120})['decay_days'], 120)
             self.assertEqual(post('/api/memories/use', {'id': self.memory.id})['id'], self.memory.id)
+            self.assertEqual(post('/api/recall', {'query': 'deployment'})['results'], [])
+            for memory in self.atlas.memories:
+                updated = post('/api/sharing', {'id': memory.id, 'target': 'mcp', 'allowed': True})
+                self.assertTrue(updated['sharing']['mcp'])
             self.assertTrue(recall('deployment', 2, base)['results'])
-            for path, payload in [('/api/settings', {'decay_days': False}), ('/api/recall', {'query': 'x', 'limit': 31})]:
+            for path, payload in [('/api/settings', {'decay_days': False}),
+                                  ('/api/recall', {'query': 'x', 'limit': 31}),
+                                  ('/api/sharing', {'id': self.memory.id, 'target': 'invalid', 'allowed': True}),
+                                  ('/api/sharing', {'id': self.memory.id, 'target': 'mcp', 'allowed': 'true'})]:
                 with self.assertRaises(HTTPError) as raised:
                     post(path, payload)
                 self.assertEqual(raised.exception.code, 400)

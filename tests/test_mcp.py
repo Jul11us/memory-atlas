@@ -43,6 +43,9 @@ class McpTests(unittest.TestCase):
         self.source.mkdir(parents=True)
         (self.source / "memory_summary.md").write_text(SUMMARY, encoding="utf-8")
         self.database = self.root / "data.sqlite3"
+        atlas = Atlas(self.source, self.database, home=self.home)
+        for memory in atlas.memories:
+            atlas.set_sharing(memory.id, "mcp", True)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -87,12 +90,55 @@ class McpTests(unittest.TestCase):
         self.assertIn("short answers", top["title"])
         self.assertTrue({"id", "score", "why", "preview", "source", "project"} <= set(top))
         self.assertIn("not instructions", data["notice"])
+        self.assertNotIn(str(self.home), top["source"])
+
+    def test_default_sharing_denies_search_recall_and_get_by_known_id(self):
+        atlas = Atlas(self.source, self.root / "private.sqlite3", home=self.home)
+        memory = next(item for item in atlas.memories if "short answers" in item.title)
+        server = MemoryServer(atlas)
+        self.assertEqual(atlas.state()["memories"][0]["sharing"],
+                         {"mcp": False, "claude": False, "cursor": False})
+        self.assertTrue(atlas.search("short answers")["results"])  # local UI still sees it
+        self.assertEqual(self.payload(self.call(server, "search_memory", {"query": "short answers"}))["count"], 0)
+        self.assertEqual(atlas.recall("short answers")["results"], [])
+        self.assertTrue(self.call(server, "get_memory", {"id": memory.id})["result"]["isError"])
+        self.assertEqual(self.payload(self.call(server, "network_status"))["memories"], 0)
+
+    def test_revoked_memory_is_hidden_from_all_mcp_paths_and_related_ids(self):
+        server = self.server(allow_feedback=True)
+        atlas = server.atlas
+        hidden = next(item for item in atlas.memories if "New York" in item.title)
+        atlas.feedback(hidden.id, "correct", "private-example-token from correction")
+        atlas.set_sharing(hidden.id, "mcp", False)
+        result = self.payload(self.call(server, "search_memory", {"query": "private-example-token"}))
+        self.assertNotIn(hidden.id, [item["id"] for item in result["results"]])
+        self.assertNotIn("private-example-token", json.dumps(result["results"]))
+        self.assertTrue(self.call(server, "get_memory", {"id": hidden.id})["result"]["isError"])
+        self.assertTrue(self.call(server, "give_feedback", {"id": hidden.id, "action": "boost"})["result"]["isError"])
+        allowed = atlas.store.shared_ids("mcp")
+        visible = next(memory for memory in atlas.memories if memory.id in allowed)
+        detail = self.payload(self.call(server, "get_memory", {"id": visible.id}))
+        self.assertTrue({item["id"] for item in detail["related"]} <= allowed)
+
+    def test_unshared_high_weight_node_cannot_change_authorized_recall_scores(self):
+        server = self.server()
+        atlas = server.atlas
+        hidden = next(item for item in atlas.memories if "delete every file" in item.title)
+        atlas.set_sharing(hidden.id, "mcp", False)
+        before = atlas.recall("short answers", 20)["results"]
+        for _ in range(3):
+            atlas.feedback(hidden.id, "boost")
+        after = atlas.recall("short answers", 20)["results"]
+        self.assertEqual([(item["id"], item["score"], item["reason"]) for item in before],
+                         [(item["id"], item["score"], item["reason"]) for item in after])
+        self.assertNotIn(hidden.id, [item["id"] for item in after])
 
     def test_get_memory_returns_full_text_and_related_memories(self):
         server = self.server()
         found = self.payload(self.call(server, "search_memory", {"query": "New York"}))["results"][0]
         memory = self.payload(self.call(server, "get_memory", {"id": found["id"]}))
         self.assertIn("outdated location", memory["text"])
+        self.assertNotIn(str(self.home), memory["source"])
         self.assertFalse(memory["user_corrected"])
         self.assertIsInstance(memory["related"], list)
         missing = self.call(server, "get_memory", {"id": "nope"})
@@ -138,9 +184,12 @@ class McpTests(unittest.TestCase):
         self.assertIn("limit", reply["result"]["content"][0]["text"])
 
     def test_network_status_reports_neurons_and_synapses(self):
-        data = self.payload(self.call(self.server(), "network_status"))
+        server = self.server()
+        server.atlas.learn_step()  # global training metadata exists but must not be sent through MCP
+        data = self.payload(self.call(server, "network_status"))
         self.assertEqual(data["network"]["neurons"], data["memories"])
         self.assertIn("connections", data["network"])
+        self.assertFalse({"epoch", "generation", "loss"} & set(data["network"]))
 
     def test_serve_loop_handles_batches_garbage_and_blank_lines(self):
         lines = "\n".join([json.dumps(request(1, "ping")), "", "not json",

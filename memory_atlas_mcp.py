@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, TextIO
 
-from memory_atlas import DEFAULT_DB, DEFAULT_SOURCE, Atlas, Network, effective_strength
+from memory_atlas import DEFAULT_DB, DEFAULT_SOURCE, Atlas, Network, effective_strength, source_label
 
 SERVER_NAME = "memory-atlas"
 SERVER_VERSION = "0.1.0"
@@ -52,7 +52,7 @@ TOOLS: list[dict[str, Any]] = [
      "annotations": {"title": "Read one memory", "readOnlyHint": False, "destructiveHint": False,
                      "idempotentHint": True}},
     {"name": "network_status",
-     "description": "Size and learning state of the memory network (neurons, synapses, epoch, accuracy) "
+     "description": "Size and association state of the approved memory network (neurons, synapses, accuracy) "
                     "and how many memories have faded.",
      "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
      "annotations": {"title": "Memory network status", "readOnlyHint": True}},
@@ -134,6 +134,8 @@ class MemoryServer:
         out: dict[str, Any] = {"query": query, "count": len(results), "results": results, "notice": NOTICE}
         if not atlas.memories:
             out["hint"] = "No memories are imported. Ask the user to open Memory Atlas, choose SOURCES and import."
+        elif not atlas.shared_memories("mcp"):
+            out["hint"] = "No memories are approved for MCP sharing. Ask the user to approve individual memories in Memory Atlas."
         return out
 
     def get_memory(self, args: dict) -> dict:
@@ -141,7 +143,8 @@ class MemoryServer:
         if not isinstance(memory_id, str):
             raise ToolError("id must be a string")
         atlas = self.fresh()
-        by_id = {memory.id: memory for memory in atlas.memories}
+        permitted = atlas.shared_memories("mcp")
+        by_id = {memory.id: memory for memory in permitted}
         memory = by_id.get(memory_id)
         if memory is None:
             raise ToolError("unknown memory id; use an id returned by search_memory")
@@ -152,7 +155,10 @@ class MemoryServer:
         if not life["dormant"]:               # reading counts as use; reviving a faded memory is the user's call
             atlas.use_memory(memory.id)
         neighbours = []
-        for (first, second), edge in atlas.network.edges.items():
+        # Build associations from the authorized subset so an unshared node cannot appear
+        # in related IDs or alter which permitted memories are associated.
+        network = Network(permitted, atlas.store)
+        for (first, second), edge in network.edges.items():
             if edge["pruned"] or memory.id not in (first, second):
                 continue
             other = by_id.get(second if first == memory.id else first)
@@ -163,7 +169,8 @@ class MemoryServer:
         neighbours.sort(key=lambda item: -item["weight"])
         out = {"id": memory.id, "title": memory.title, "project": memory.project, "tool": memory.tool,
                "kind": memory.kind, "date": memory.date, "text": text[:MAX_TEXT],
-               "truncated": len(text) > MAX_TEXT, "source": f"{memory.source}:{memory.source_line}",
+               "truncated": len(text) > MAX_TEXT,
+               "source": f"{source_label(memory.source)}:{memory.source_line}",
                "strength": round(effective_strength(memory, state), 3),
                "user_corrected": bool((state.get("correction") or "").strip()),
                "dormant": life["dormant"], "retention": round(life["retention"], 3),
@@ -172,10 +179,17 @@ class MemoryServer:
 
     def network_status(self, args: dict) -> dict:
         atlas = self.fresh()
-        stats = atlas.network.snapshot(atlas.network.labels(atlas.store.all()))["stats"]
-        state = atlas.state()
-        return {"memories": len(atlas.memories), "faded": state["dormant_count"],
-                "lifetime_days": state["settings"]["decay_days"], "sources": state["active_sources"],
+        permitted = atlas.shared_memories("mcp")
+        network = Network(permitted, atlas.store)
+        stats = network.snapshot(network.labels(atlas.store.all()))["stats"]
+        # Epoch, generation and loss are global training metadata and may include
+        # unshared memories. The remaining values are computed from this subset.
+        for key in ("epoch", "generation", "loss"):
+            stats.pop(key, None)
+        lifecycle = atlas.lifecycle()
+        return {"memories": len(permitted), "faded": sum(lifecycle[item.id]["dormant"] for item in permitted),
+                "lifetime_days": atlas.store.settings()["decay_days"],
+                "sources": sorted({item.tool for item in permitted}),
                 "network": stats}
 
     def give_feedback(self, args: dict) -> dict:
@@ -185,7 +199,7 @@ class MemoryServer:
         if self.feedback_used >= MAX_FEEDBACK_PER_SESSION:
             raise ToolError(f"feedback limit reached ({MAX_FEEDBACK_PER_SESSION} per session)")
         atlas = self.fresh()
-        memory = next((item for item in atlas.memories if item.id == memory_id), None)
+        memory = next((item for item in atlas.shared_memories("mcp") if item.id == memory_id), None)
         if memory is None:
             raise ToolError("unknown memory id; use an id returned by search_memory")
         state = atlas.feedback(memory_id, action)

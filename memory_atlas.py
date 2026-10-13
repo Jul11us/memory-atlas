@@ -11,6 +11,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import unicodedata
 from contextlib import contextmanager
@@ -70,6 +71,11 @@ def project_label(raw: str) -> str:
     if "Desktop/" in value:
         return value.split("Desktop/", 1)[1]
     return value.rsplit("/", 1)[-1] or "全局"
+
+
+def source_label(raw: str) -> str:
+    """A provenance hint safe to send to an agent without the user's full local path."""
+    return raw.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1] or "unknown"
 
 
 def source_date(path: Path) -> str:
@@ -526,11 +532,53 @@ class FeedbackStore:
                 ids TEXT NOT NULL,
                 written_at TEXT NOT NULL
             )""")
+            db.execute("""CREATE TABLE IF NOT EXISTS memory_sharing (
+                memory_id TEXT PRIMARY KEY,
+                mcp INTEGER NOT NULL DEFAULT 0,
+                claude INTEGER NOT NULL DEFAULT 0,
+                cursor INTEGER NOT NULL DEFAULT 0
+            )""")
+            db.execute("""CREATE TABLE IF NOT EXISTS sharing_meta (
+                key TEXT PRIMARY KEY,
+                value INTEGER NOT NULL
+            )""")
             db.execute("""CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value INTEGER NOT NULL
             )""")
             db.execute("INSERT OR IGNORE INTO settings(key, value) VALUES('decay_days', 90)")
+            # Existing exports were explicitly written by the user before sharing controls existed.
+            # Grant only IDs still present in a live, marked export, and do it once so a later
+            # revocation is never undone by another process opening this database.
+            migrated = db.execute("SELECT value FROM sharing_meta WHERE key='existing_exports'").fetchone()
+            if migrated is None:
+                for kind in ("claude", "cursor"):
+                    for row in db.execute(f"SELECT target, ids FROM {kind}_exports"):
+                        if not self._is_live_export(row["target"], kind):
+                            continue
+                        try:
+                            identifiers = json.loads(row["ids"])
+                        except (TypeError, ValueError):
+                            continue
+                        if not isinstance(identifiers, list):
+                            continue
+                        for identifier in identifiers:
+                            if isinstance(identifier, str):
+                                db.execute(f"""INSERT INTO memory_sharing(memory_id, {kind}) VALUES(?, 1)
+                                               ON CONFLICT(memory_id) DO UPDATE SET {kind}=1""", (identifier,))
+                db.execute("INSERT INTO sharing_meta(key, value) VALUES('existing_exports', 1)")
+
+    @staticmethod
+    def _is_live_export(raw_target: str, kind: str) -> bool:
+        try:
+            target = Path(raw_target)
+            if target.is_symlink() or not target.is_file():
+                return False
+            expected = EXPORT_MARKER if kind == "claude" else f"{CURSOR_EXPORT_HEADER}{EXPORT_MARKER}"
+            with target.open("r", encoding="utf-8", errors="replace") as handle:
+                return handle.read(len(expected)) == expected
+        except (OSError, ValueError):
+            return False
 
     @contextmanager
     def connect(self):
@@ -548,6 +596,38 @@ class FeedbackStore:
     def all(self) -> dict[str, dict]:
         with self.connect() as db:
             return {row["memory_id"]: dict(row) for row in db.execute("SELECT * FROM feedback")}
+
+    @staticmethod
+    def _sharing_target(target: str) -> str:
+        if not isinstance(target, str) or target not in {"mcp", "claude", "cursor"}:
+            raise ValueError("共享目标只能是 mcp、claude 或 cursor")
+        return target
+
+    def sharing(self) -> dict[str, dict[str, bool]]:
+        with self.connect() as db:
+            return {row["memory_id"]: {name: bool(row[name]) for name in ("mcp", "claude", "cursor")}
+                    for row in db.execute("SELECT * FROM memory_sharing")}
+
+    def sharing_for(self, memory_id_value: str) -> dict[str, bool]:
+        return self.sharing().get(memory_id_value, {"mcp": False, "claude": False, "cursor": False})
+
+    def shared_ids(self, target: str) -> set[str]:
+        target = self._sharing_target(target)
+        with self.connect() as db:
+            return {row["memory_id"] for row in db.execute(
+                f"SELECT memory_id FROM memory_sharing WHERE {target}=1")}
+
+    def set_sharing(self, memory_id_value: str, target: str, allowed: bool) -> dict[str, bool]:
+        target = self._sharing_target(target)
+        if type(allowed) is not bool:
+            raise ValueError("共享权限必须是 true 或 false")
+        with self.connect() as db:
+            db.execute(f"""INSERT INTO memory_sharing(memory_id, {target}) VALUES(?, ?)
+                           ON CONFLICT(memory_id) DO UPDATE SET {target}=excluded.{target}""",
+                       (memory_id_value, int(allowed)))
+            row = db.execute("SELECT mcp, claude, cursor FROM memory_sharing WHERE memory_id=?",
+                             (memory_id_value,)).fetchone()
+        return {name: bool(row[name]) for name in ("mcp", "claude", "cursor")}
 
     def register_memories(self, ids: list[str], now: datetime) -> None:
         with self.connect() as db:
@@ -1037,6 +1117,7 @@ class Atlas:
         self.extra_folders = [*(workspaces or []), *(Path(item) for item in variable.split(os.pathsep) if item.strip())]
         self._workspace_cache: tuple[float, list[Path]] | None = None
         self.store = FeedbackStore(database)
+        self._sharing_lock = threading.RLock()
         self.export_enabled = True      # the fictional demo turns this off so it never writes files
         self.memories: list[Memory] = []
         self.network: Network
@@ -1196,6 +1277,7 @@ class Atlas:
 
     def state(self) -> dict:
         feedback = self.store.all()
+        sharing = self.store.sharing()
         lifecycle = self.lifecycle(feedback)
         hubs, links = build_links(self.memories)
         items = []
@@ -1205,6 +1287,7 @@ class Atlas:
             item["feedback"] = {key: feedback.get(memory.id, {}).get(key, value)
                                 for key, value in {"boost": 0, "pinned": 0,
                                                    "archived": 0, "correction": ""}.items()}
+            item["sharing"] = sharing.get(memory.id, {"mcp": False, "claude": False, "cursor": False})
             item["lifecycle"] = lifecycle[memory.id]
             item["strength"] = round(effective_strength(memory, item["feedback"]) * lifecycle[memory.id]["retention"], 3)
             items.append(item)
@@ -1233,18 +1316,59 @@ class Atlas:
         return {"id": identifier, "lifecycle": self.lifecycle()[identifier],
                 "strength": round(effective_strength(memory, self.store.all().get(identifier, {})), 3)}
 
+    def shared_memories(self, target: str) -> list[Memory]:
+        permitted = self.store.shared_ids(target)
+        return [memory for memory in self.memories if memory.id in permitted]
+
+    def set_sharing(self, memory_id_value: object, target: object, allowed: object) -> dict:
+        with self._sharing_lock:
+            return self._set_sharing_locked(memory_id_value, target, allowed)
+
+    def _set_sharing_locked(self, memory_id_value: object, target: object, allowed: object) -> dict:
+        if not isinstance(memory_id_value, str) or not any(
+                memory.id == memory_id_value for memory in self.memories):
+            raise ValueError("记忆不存在，请先同步数据")
+        if not isinstance(target, str) or target not in {"mcp", "claude", "cursor"}:
+            raise ValueError("共享目标只能是 mcp、claude 或 cursor")
+        if type(allowed) is not bool:
+            raise ValueError("共享权限必须是 true 或 false")
+        if not allowed and target in {"claude", "cursor"}:
+            for record in self.store.exports(target):
+                try:
+                    contains_memory = memory_id_value in json.loads(record["ids"])
+                except (TypeError, ValueError):
+                    contains_memory = False
+                path = Path(record["target"])
+                if not contains_memory:
+                    continue
+                try:
+                    live_file = path.exists() or path.is_symlink()
+                except OSError as error:
+                    raise ValueError(f"无法核查 {target} 导出文件；请先检查或移除：{path}") from error
+                if live_file:
+                    raise ValueError(
+                        f"这条记忆仍在 {target} 导出文件中；请先移除该导出文件再关闭共享：{path}")
+        return {"id": memory_id_value,
+                "sharing": self.store.set_sharing(memory_id_value, target, allowed)}
+
     def recall(self, query: str, limit: int = 5) -> dict:
         if not isinstance(query, str) or not query.strip() or len(query) > 200:
             raise ValueError("请输入 1 到 200 字的检索问题")
         if type(limit) is not int or not 1 <= limit <= 30:
             raise ValueError("limit 必须是 1 到 30 的整数")
-        ranking = self.search(query)["results"][:limit]
-        lookup = {memory.id: memory for memory in self.memories}
+        permitted = self.shared_memories("mcp")
         feedback = self.store.all()
+        lifecycle = self.lifecycle(feedback)
+        # Build the query graph from permitted memories only. Otherwise a hidden node could
+        # change scores or make an otherwise hidden association visible to the agent.
+        network = Network(permitted, self.store)
+        ranking = rank_memories(permitted, feedback, query, network, lifecycle)[:limit]
+        lookup = {memory.id: memory for memory in permitted}
         results = [{**row, "title": lookup[row["id"]].title,
                     "text": feedback.get(row["id"], {}).get("correction") or lookup[row["id"]].text,
                     "project": lookup[row["id"]].project, "tool": lookup[row["id"]].tool,
-                    "source": lookup[row["id"]].source, "source_line": lookup[row["id"]].source_line}
+                    "source": source_label(lookup[row["id"]].source),
+                    "source_line": lookup[row["id"]].source_line}
                    for row in ranking]
         self.store.use_memories([row["id"] for row in results], datetime.now(timezone.utc))
         return {"query": query, "results": results, "renewed": len(results),
@@ -1285,16 +1409,18 @@ class Atlas:
         except OSError:
             return True, False
 
-    def _export_rows(self, limit: int, only_project: str, excluded_tool: str = "Claude Code") -> list[dict]:
+    def _export_rows(self, limit: int, only_project: str, excluded_tool: str = "Claude Code",
+                     share_target: str = "claude") -> list[dict]:
         """Highest current weight first, pinned memories before all others. Down-weighted, archived and faded
         memories stay out, and so do Claude Code's own files, which Claude already reads."""
         feedback = self.store.all()
         lifecycle = self.lifecycle(feedback)
+        permitted = self.store.shared_ids(share_target)
         rows = []
         for memory in self.memories:
             state = feedback.get(memory.id, {})
             life = lifecycle[memory.id]
-            if memory.tool == excluded_tool or state.get("archived") or life["dormant"] \
+            if memory.id not in permitted or memory.tool == excluded_tool or state.get("archived") or life["dormant"] \
                     or int(state.get("boost", 0)) < 0 or (only_project and memory.project != only_project):
                 continue
             correction = (state.get("correction") or "").strip()
@@ -1354,13 +1480,18 @@ class Atlas:
 
     def export_write(self, scope: object, project: object = "", limit: object = 20,
                      only_project: object = "", digest: str = "") -> dict:
+        with self._sharing_lock:
+            return self._export_write_locked(scope, project, limit, only_project, digest)
+
+    def _export_write_locked(self, scope: object, project: object = "", limit: object = 20,
+                             only_project: object = "", digest: str = "") -> dict:
         if not self.export_enabled:
             raise ValueError("演示模式只预览，不会写入 Claude Code 文件")
         preview = self.export_preview(scope, project, limit, only_project)
-        if not preview["count"]:
-            raise ValueError("没有可导出的记忆：降权、已消散和来自 Claude Code 本身的记忆不会导出")
         if digest != preview["digest"]:
-            raise ValueError("预览之后记忆或权重有变化，请重新预览确认后再写入")
+            raise ValueError("预览之后记忆、权重或共享权限有变化，请重新预览确认后再写入")
+        if not preview["count"]:
+            raise ValueError("没有可导出的记忆：请先逐条允许共享；降权、已消散和来自 Claude Code 本身的记忆也不会导出")
         if preview["exists"] and not preview["owned"]:
             raise ValueError("目标位置已有同名文件，且不是 Memory Atlas 生成的，不会覆盖")
         target = Path(preview["target"])
@@ -1380,6 +1511,10 @@ class Atlas:
                 "last_export": {"written_at": written_at, "count": preview["count"]}}
 
     def export_remove(self, scope: object, project: object = "") -> dict:
+        with self._sharing_lock:
+            return self._export_remove_locked(scope, project)
+
+    def _export_remove_locked(self, scope: object, project: object = "") -> dict:
         if not self.export_enabled:
             raise ValueError("演示模式不会修改 Claude Code 文件")
         target = self._export_target(scope, project)
@@ -1467,7 +1602,7 @@ class Atlas:
                               only_project: object = "") -> dict:
         target = self._cursor_target(scope, project)
         limit, only_project = self._export_options(limit, only_project)
-        rows = self._export_rows(limit, only_project, "Cursor 规则")
+        rows = self._export_rows(limit, only_project, "Cursor 规则", "cursor")
         blocks, ids = [], []
         omitted, lines_used, chars_used = 0, 10, 0
         for row in rows:
@@ -1507,13 +1642,18 @@ class Atlas:
 
     def cursor_export_write(self, scope: object, project: object = "", limit: object = 20,
                             only_project: object = "", digest: str = "") -> dict:
+        with self._sharing_lock:
+            return self._cursor_export_write_locked(scope, project, limit, only_project, digest)
+
+    def _cursor_export_write_locked(self, scope: object, project: object = "", limit: object = 20,
+                                    only_project: object = "", digest: str = "") -> dict:
         if not self.export_enabled:
             raise ValueError("演示模式只预览，不会写入 Cursor 文件")
         preview = self.cursor_export_preview(scope, project, limit, only_project)
-        if not preview["count"]:
-            raise ValueError("没有可导出的记忆")
         if digest != preview["digest"]:
-            raise ValueError("预览之后记忆或权重有变化，请重新预览确认后再写入")
+            raise ValueError("预览之后记忆、权重或共享权限有变化，请重新预览确认后再写入")
+        if not preview["count"]:
+            raise ValueError("没有可导出的记忆：请先逐条允许共享")
         if not preview["git_safe"]:
             raise ValueError(preview["git_message"])
         if preview["exists"] and not preview["owned"]:
@@ -1539,6 +1679,10 @@ class Atlas:
                 "last_export": {"written_at": written_at, "count": preview["count"]}}
 
     def cursor_export_remove(self, scope: object, project: object = "") -> dict:
+        with self._sharing_lock:
+            return self._cursor_export_remove_locked(scope, project)
+
+    def _cursor_export_remove_locked(self, scope: object, project: object = "") -> dict:
         if not self.export_enabled:
             raise ValueError("演示模式不会修改 Cursor 文件")
         target = self._cursor_target(scope, project)
@@ -1666,6 +1810,9 @@ class AtlasHandler(BaseHTTPRequestHandler):
                                              str(body.get("action", "")),
                                              str(body.get("correction", "")))
                 self._json({"feedback": result})
+            elif self.path == "/api/sharing":
+                self._json(self.atlas.set_sharing(body.get("id"), body.get("target"),
+                                                  body.get("allowed")))
             elif self.path == "/api/settings":
                 self._json(self.atlas.store.set_decay_days(body.get("decay_days")))
             elif self.path == "/api/memories/use":

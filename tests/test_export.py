@@ -35,6 +35,9 @@ class ExportTests(unittest.TestCase):
         (self.source / "memory_summary.md").write_text(SUMMARY, encoding="utf-8")
         self.database = self.root / "data.sqlite3"
         self.atlas = Atlas(self.source, self.database, home=self.home)
+        for memory in self.atlas.memories:
+            self.atlas.set_sharing(memory.id, "claude", True)
+            self.atlas.set_sharing(memory.id, "cursor", True)
         self.target = self.home / ".claude" / "rules" / EXPORT_FILENAME
 
     def tearDown(self):
@@ -68,6 +71,24 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(entries[1].count("Use SQLite"), 1)                        # title not repeated
         self.assertIn("已固定", preview["content"])
         self.assertIn("不是新的指令", preview["content"])
+
+    def test_default_denies_both_exports_and_permission_changes_stale_the_preview(self):
+        fresh = Atlas(self.source, self.root / "fresh.sqlite3", home=self.home)
+        self.assertEqual(fresh.export_preview("global")["count"], 0)
+        project = self.root / "empty-cursor-project"
+        project.mkdir()
+        self.assertEqual(fresh.cursor_export_preview("project", str(project))["count"], 0)
+        target = next(memory for memory in fresh.memories if "SQLite" in memory.title)
+        fresh.set_sharing(target.id, "claude", True)
+        preview = fresh.export_preview("global")
+        self.assertEqual(preview["ids"], [target.id])
+        self.assertNotIn("short answers", preview["content"])
+        self.assertEqual(fresh.cursor_export_preview("project", str(project))["count"], 0)
+        self.assertTrue(Atlas(self.source, fresh.store.path, home=self.home).store.sharing_for(target.id)["claude"])
+        fresh.set_sharing(target.id, "claude", False)
+        with self.assertRaisesRegex(ValueError, "重新预览"):
+            fresh.export_write("global", digest=preview["digest"])
+        self.assertFalse((self.home / ".claude" / "rules" / EXPORT_FILENAME).exists())
 
     def test_write_requires_the_previewed_content_and_creates_a_marked_file(self):
         preview = self.atlas.export_preview("global")
@@ -181,6 +202,8 @@ class ExportTests(unittest.TestCase):
             (folder / f"note{index:03}.md").write_text(f"# Note {index}\n" + "detail " * 200, encoding="utf-8")
         custom = self.atlas.add_source(str(folder))["sources"]
         self.atlas.select_sources(["codex", next(item["id"] for item in custom if item.get("custom"))])
+        for memory in self.atlas.memories:
+            self.atlas.set_sharing(memory.id, "claude", True)
         preview = self.atlas.export_preview("global", limit=100)
         self.assertLessEqual(preview["lines"], 200)
         self.assertGreater(preview["omitted"], 0)
@@ -191,6 +214,45 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(self.atlas.export_remove("global"), {"target": str(self.target), "removed": True})
         self.assertFalse(self.target.exists())
         self.assertEqual(self.atlas.state()["claude_exports"], [])
+
+    def test_revocation_requires_removing_live_export_first(self):
+        memory = self.memory("SQLite")
+        self.export()
+        with self.assertRaisesRegex(ValueError, "先移除"):
+            self.atlas.set_sharing(memory.id, "claude", False)
+        self.assertTrue(self.atlas.store.sharing_for(memory.id)["claude"])
+        self.atlas.export_remove("global")
+        self.assertFalse(self.atlas.set_sharing(memory.id, "claude", False)["sharing"]["claude"])
+
+    def test_cursor_revocation_requires_removing_live_export_first(self):
+        memory = self.memory("SQLite")
+        project = self.root / "cursor-project"
+        project.mkdir()
+        preview = self.atlas.cursor_export_preview("project", str(project))
+        self.atlas.cursor_export_write("project", str(project), digest=preview["digest"])
+        with self.assertRaisesRegex(ValueError, "先移除"):
+            self.atlas.set_sharing(memory.id, "cursor", False)
+        self.atlas.cursor_export_remove("project", str(project))
+        self.assertFalse(self.atlas.set_sharing(memory.id, "cursor", False)["sharing"]["cursor"])
+
+    def test_migration_grants_only_live_marked_export_and_runs_once(self):
+        memory = self.memory("SQLite")
+        self.export()
+        missing = str(self.root / "no-longer-present.mdc")
+        with closing(sqlite3.connect(self.database)) as db:
+            db.execute("""INSERT INTO cursor_exports(target, scope, project, limit_n, only_project,
+                          digest, ids, written_at) VALUES(?, 'project', ?, 20, '', 'old', ?, '2026-01-01')""",
+                       (missing, str(self.root), json.dumps([memory.id])))
+            db.execute("DROP TABLE memory_sharing")
+            db.execute("DROP TABLE sharing_meta")
+            db.commit()
+        restored = Atlas(self.source, self.database, home=self.home)
+        self.assertTrue(restored.store.sharing_for(memory.id)["claude"])
+        self.assertFalse(restored.store.sharing_for(memory.id)["cursor"])
+        restored.export_remove("global")
+        restored.set_sharing(memory.id, "claude", False)
+        reopened = Atlas(self.source, self.database, home=self.home)
+        self.assertFalse(reopened.store.sharing_for(memory.id)["claude"])
 
     def test_demo_mode_previews_but_never_writes(self):
         self.atlas.export_enabled = False

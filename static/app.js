@@ -17,6 +17,8 @@ let activeFilter = "all";
 let currentQuery = "";
 let searchVersion = 0;
 let toastTimer;
+let sharingBusy = false;
+let sharingMessage = null;
 let graphNodes = new Map();
 let graphLayers = [];
 let layoutIsMobile = null;
@@ -342,6 +344,30 @@ function renderDetail() {
   if (life) setText("memory-lifetime", life.exempt === "pinned" ? "已固定，持续保留。" : life.exempt === "disabled" ? "已关闭自动消散。" : `${life.last_used ? `最近使用 ${new Date(life.last_used).toLocaleString()}` : "从首次导入开始计时，尚未使用"} · ${life.dormant ? "已消散，不参与正常召回" : `约 ${life.days_remaining} 天后消散，保留 ${Math.round(life.retention * 100)}%`}。`);
   renderSynapseList(memory);
   renderExportNote(memory);
+  renderSharingControls(memory);
+}
+
+function setSharingMessage(id, text, error = false) {
+  sharingMessage = {id, text, error};
+  const note = byId("sharing-status");
+  note.hidden = id !== selectedId;
+  if (!note.hidden) { note.textContent = text; note.classList.toggle("is-error", error); }
+  const exportNote = byId("export-permissions-status");
+  exportNote.hidden = !byId("export-dialog").open;
+  if (!exportNote.hidden) { exportNote.textContent = text; exportNote.classList.toggle("is-error", error); }
+}
+
+function renderSharingControls(memory) {
+  byId("sharing-controls").querySelectorAll("input[data-sharing-target]").forEach((input) => {
+    input.checked = memory.sharing?.[input.dataset.sharingTarget] === true;
+    input.disabled = sharingBusy;
+  });
+  const note = byId("sharing-status");
+  note.hidden = sharingMessage?.id !== memory.id;
+  if (!note.hidden) {
+    note.textContent = sharingMessage.text;
+    note.classList.toggle("is-error", sharingMessage.error);
+  }
 }
 
 function selectMemory(id) {
@@ -404,6 +430,7 @@ async function loadState() {
   byId("search-input").disabled = false;
   byId("search-form").querySelector("button").disabled = false;
   byId("quick-search-input").disabled = false;
+  if (byId("export-dialog").open) renderExportPermissionList();
 }
 
 async function search(query, preserveSelection = false) {
@@ -1249,8 +1276,9 @@ byId("source-import").addEventListener("click", async () => {
     notify(`已导入 ${atlas.count} 条记忆`);
   } catch (error) { notify(error.message); }
 });
-// --- export to Claude Code or Cursor: preview first, write only what was previewed -----------
+// --- per-memory sharing and preview-first exports --------------------------------------------
 let exportPreview = null;
+let exportPreviewVersion = 0;
 
 function exportKind() { return byId("export-target").value; }
 
@@ -1259,8 +1287,8 @@ function syncExportTarget() {
   byId("export-kicker").textContent = cursor ? "EXPORT / CURSOR" : "EXPORT / CLAUDE CODE";
   byId("export-heading").textContent = cursor ? "导出到 Cursor" : "导出到 Claude Code";
   byId("export-intro").textContent = cursor
-    ? "将预览过的记忆写入这个项目的 Cursor 规则，供 Cursor 按需引用。Cursor 规则可能随项目提交；Git 项目必须先在本地忽略目标文件，Memory Atlas 才会写入。已消散、降权和来自 Cursor 规则本身的记忆不会导出。"
-    : "按当前权重挑出记忆，写成 Claude Code 后续会话会读取的规则文件。原记忆仍可调整，改动后需重新导出。降权、已消散和来自 Claude Code 本身的记忆不会导出。";
+    ? "默认仅本地；先逐条授权，再预览并写入 Cursor 项目规则。勾选权限不会写文件。Cursor 规则可能随项目提交；Git 项目必须先在本地忽略目标文件。"
+    : "默认仅本地；先逐条授权，再预览并写入 Claude Code 规则。勾选权限不会写文件；原记忆调整后需重新导出。";
   byId("export-global-choice").hidden = cursor;
   byId("export-project-target").textContent = cursor
     ? "项目/.cursor/rules/memory-atlas.mdc" : "项目/.claude/rules/memory-atlas.md";
@@ -1272,6 +1300,97 @@ function exportOptions() {
   const scope = document.querySelector("input[name=export-scope]:checked").value;
   return {scope, project: scope === "project" ? byId("export-project").value.trim() : "",
     limit: Number.parseInt(byId("export-limit").value, 10) || 0, only_project: byId("export-filter").value};
+}
+
+function exportIneligibleReason(memory, target) {
+  if (memory.tool === (target === "cursor" ? "Cursor 规则" : "Claude Code")) return "目标自身来源";
+  if (memory.feedback.archived) return "已归档";
+  if (memory.lifecycle?.dormant) return "已消散";
+  if (memory.feedback.boost < 0) return "已降权";
+  return "";
+}
+
+function renderExportPermissionList() {
+  if (!atlas) return;
+  const target = exportKind();
+  const project = byId("export-filter").value;
+  const query = byId("export-candidate-query").value.trim().toLocaleLowerCase();
+  const memories = atlas.memories.filter((memory) => !project || memory.project === project);
+  const eligible = memories.filter((memory) => !exportIneligibleReason(memory, target));
+  const allowed = eligible.filter((memory) => memory.sharing?.[target] === true).length;
+  const previewed = exportPreview?.ids?.length || 0;
+  setText("export-permissions-count", `可选 ${eligible.length} · 已授权 ${allowed} · 本次预览 ${previewed}`);
+  const matches = memories.filter((memory) => !query ||
+    `${displayTitle(memory)} ${memory.project} ${memory.id}`.toLocaleLowerCase().includes(query));
+  matches.sort((a, b) => Number(!exportIneligibleReason(b, target)) - Number(!exportIneligibleReason(a, target)) ||
+    Number(b.sharing?.[target] === true) - Number(a.sharing?.[target] === true));
+  const list = byId("export-candidate-list");
+  list.replaceChildren();
+  for (const memory of matches.slice(0, 80)) {
+    const reason = exportIneligibleReason(memory, target);
+    const row = document.createElement("label");
+    row.className = `export-candidate${reason ? " is-unavailable" : ""}${exportPreview?.ids?.includes(memory.id) ? " is-previewed" : ""}`;
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.dataset.memoryId = memory.id;
+    input.checked = memory.sharing?.[target] === true;
+    input.disabled = sharingBusy || Boolean(reason);
+    input.setAttribute("aria-label", `${memory.project} / ${displayTitle(memory)}：允许导出到 ${target === "cursor" ? "Cursor" : "Claude Code"}`);
+    const description = document.createElement("span");
+    description.className = "export-candidate-content";
+    const title = document.createElement("strong");
+    title.textContent = displayTitle(memory);
+    const meta = document.createElement("small");
+    meta.textContent = `${memory.project} · ${reason || (exportPreview?.ids?.includes(memory.id) ? "本次预览包含" : "可授权")}`;
+    const id = document.createElement("code");
+    id.textContent = memory.id;
+    description.append(title, meta, id);
+    row.append(input, description);
+    list.append(row);
+  }
+  if (!matches.length) {
+    const empty = document.createElement("p");
+    empty.className = "export-candidate-empty";
+    empty.textContent = query ? "没有匹配的记忆，请换个标题、项目或 ID。" : "当前范围没有记忆。";
+    list.append(empty);
+  } else if (matches.length > 80) {
+    const more = document.createElement("p");
+    more.className = "export-candidate-empty";
+    more.textContent = `当前显示前 80 / ${matches.length} 条；输入标题、项目或 ID 可继续查找。`;
+    list.append(more);
+  }
+}
+
+async function changeSharing(id, target, allowed) {
+  if (sharingBusy || !["mcp", "claude", "cursor"].includes(target)) return;
+  sharingBusy = true;
+  invalidateExportPreview("共享权限正在保存，完成后将重新预览。");
+  byId("export-preview").hidden = true;
+  renderExportPermissionList();
+  if (currentMemory()?.id === id) renderSharingControls(currentMemory());
+  let saved = false;
+  try {
+    const response = await post("/api/sharing", {id, target, allowed});
+    saved = true;
+    const local = atlas.memories.find((memory) => memory.id === id);
+    if (local && response.sharing) local.sharing = response.sharing;
+    await loadState();
+    if (byId("export-dialog").open) await previewExport();
+    const savedMessage = target === "mcp"
+      ? allowed ? "已允许 MCP 工具和 /api/recall 按需查询这条记忆。" : "已撤销 MCP / API 召回权限。"
+      : allowed ? "已授权；请检查导出预览并点击写入。单击权限不会写规则文件。" : "已撤销此目标的导出权限。";
+    setSharingMessage(id, savedMessage, false);
+  } catch (error) {
+    const message = saved ? `权限已保存，但页面刷新失败：${error.message}` :
+      `${error.message}${!allowed && target !== "mcp" && !error.message.includes("导出") ? "；如该记忆已写入规则文件，请先移除对应导出文件" : ""}`;
+    setSharingMessage(id, message, true);
+    notify(message);
+    if (byId("export-dialog").open) await previewExport();
+  } finally {
+    sharingBusy = false;
+    if (currentMemory()) renderSharingControls(currentMemory());
+    if (byId("export-dialog").open) renderExportPermissionList();
+  }
 }
 
 function renderExportButton() {
@@ -1297,9 +1416,11 @@ function renderExportNote(memory) {
 }
 
 function invalidateExportPreview(message) {
+  exportPreviewVersion++;
   exportPreview = null;
   byId("export-write").disabled = true;
   if (message) setText("export-meta", message);
+  if (byId("export-dialog").open) renderExportPermissionList();
 }
 
 function renderExportPreview(data) {
@@ -1310,7 +1431,7 @@ function renderExportPreview(data) {
   preview.textContent = data.content;
   const parts = [`写入位置：${data.target}`, `${data.count} 条 · ${data.lines} 行`];
   if (data.omitted) parts.push(`另有 ${data.omitted} 条超出导出长度限制，未写入`);
-  if (!data.count) parts.push(`没有可导出的记忆：降权、已消散和来自 ${cursor ? "Cursor 规则" : "Claude Code"} 本身的记忆不导出`);
+  if (!data.count) parts.push(`没有可导出的记忆：需逐条授权；降权、已消散和来自 ${cursor ? "Cursor 规则" : "Claude Code"} 本身的记忆也不导出`);
   if (data.exists && !data.owned) parts.push("目标位置已有同名文件，且不是 Memory Atlas 生成的，不会覆盖");
   else if (data.last_export) parts.push(data.changed ? "与上次导出相比有变化" : "与上次导出的内容一致");
   if (cursor) parts.push(data.git_message);
@@ -1320,12 +1441,19 @@ function renderExportPreview(data) {
   byId("export-write").disabled = !data.enabled || !data.count || (data.exists && !data.owned) || (cursor && !data.git_safe);
   byId("export-write").textContent = `${data.exists && data.owned ? "更新" : "写入"}${cursor ? " Cursor" : " Claude Code"}文件`;
   byId("export-remove").hidden = !(data.enabled && data.exists && data.owned);
+  renderExportPermissionList();
 }
 
 async function previewExport() {
+  const version = ++exportPreviewVersion;
+  const kind = exportKind();
+  const options = exportOptions();
   try {
-    renderExportPreview(await post(`/api/export/${exportKind()}/preview`, exportOptions()));
+    const data = await post(`/api/export/${kind}/preview`, options);
+    if (version !== exportPreviewVersion) return;
+    renderExportPreview(data);
   } catch (error) {
+    if (version !== exportPreviewVersion) return;
     invalidateExportPreview(error.message);
     byId("export-preview").hidden = true;
     byId("export-remove").hidden = true;
@@ -1339,19 +1467,30 @@ function openExportDialog() {
   filter.value = atlas.hubs.some((hub) => hub.name === current) ? current : "";
   syncExportTarget();
   byId("export-dialog").showModal();
+  renderExportPermissionList();
   previewExport();
 }
 
 byId("export-button").addEventListener("click", openExportDialog);
 byId("export-close").addEventListener("click", () => byId("export-dialog").close());
 byId("export-form").addEventListener("submit", (event) => { event.preventDefault(); previewExport(); });
-byId("export-form").addEventListener("input", () => invalidateExportPreview("选项已改变，请点“预览”。"));
+byId("export-form").addEventListener("input", () => { invalidateExportPreview("选项已改变，请点“预览”。"); renderExportPermissionList(); });
 byId("export-form").addEventListener("change", (event) => {
   syncExportTarget();
+  renderExportPermissionList();
   const project = document.querySelector("input[name=export-scope]:checked").value === "project";
   byId("export-project").hidden = !project;
   if (event.target.name === "export-scope" && project) { byId("export-project").focus(); return; }
   if (event.target.id !== "export-project") previewExport();
+});
+byId("export-candidate-query").addEventListener("input", renderExportPermissionList);
+byId("sharing-controls").addEventListener("change", (event) => {
+  const input = event.target.closest("input[data-sharing-target]");
+  if (input && selectedId) changeSharing(selectedId, input.dataset.sharingTarget, input.checked);
+});
+byId("export-candidate-list").addEventListener("change", (event) => {
+  const input = event.target.closest("input[data-memory-id]");
+  if (input) changeSharing(input.dataset.memoryId, exportKind(), input.checked);
 });
 byId("export-write").addEventListener("click", async () => {
   if (!exportPreview) return;
